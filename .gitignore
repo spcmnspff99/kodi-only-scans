@@ -1,0 +1,35 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Secrets – never commit the real .env ─────────────────────────────────────
+.env
+
+# ── Docker build artefacts ────────────────────────────────────────────────────
+*.tar
+
+# ── Editor artefacts ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+
+# ── Runtime data (kept in Docker volume, not source tree) ────────────────────
+*.db
+*.sqlite
+*.sqlite3

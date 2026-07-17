@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  kodi-scanner:
+    build: .
+    container_name: kodi-only-scans
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      - scanner-data:/data
+    # Optional: run an initial scan immediately on startup
+    # (remove if you prefer cron-only or manual triggers)
+    # command: >
+    #   sh -c "uvicorn main:app --host 0.0.0.0 --port 8080 &
+    #          sleep 10 && python -c 'from main import run_scan; run_scan()' &&
+    #          wait"
+
+volumes:
+  scanner-data:
+    driver: local
