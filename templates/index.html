@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kodi Only Scans</title>
+  <style>
+    /* ── Reset & base ───────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f1117;
+      color: #e0e0e0;
+      min-height: 100vh;
+      padding: 2rem 1rem;
+    }
+
+    a { color: #5b9bd5; }
+
+    /* ── Layout ────────────────────────────────────────────────────── */
+    .container { max-width: 900px; margin: 0 auto; }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 2rem;
+      flex-wrap: wrap;
+      gap: 1rem;
+    }
+
+    header h1 {
+      font-size: 1.6rem;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    header h1 span { color: #5b9bd5; }
+
+    /* ── Scan button ───────────────────────────────────────────────── */
+    #scanBtn {
+      background: #5b9bd5;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 0.55rem 1.4rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    #scanBtn:hover  { background: #4a88c4; }
+    #scanBtn:active { background: #3a74b0; }
+    #scanBtn:disabled { background: #3a4a5a; cursor: not-allowed; }
+
+    /* ── Status banner ─────────────────────────────────────────────── */
+    #statusMsg {
+      margin-top: 0.6rem;
+      font-size: 0.88rem;
+      min-height: 1.2em;
+      color: #a0c8f0;
+    }
+
+    /* ── Section heading ───────────────────────────────────────────── */
+    h2 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #a0b8cc;
+      margin-bottom: 0.8rem;
+      border-bottom: 1px solid #2a3040;
+      padding-bottom: 0.4rem;
+    }
+
+    /* ── History table ─────────────────────────────────────────────── */
+    .table-wrap {
+      overflow-x: auto;
+      border-radius: 8px;
+      border: 1px solid #2a3040;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }
+
+    thead tr { background: #1a2030; }
+
+    th {
+      text-align: left;
+      padding: 0.65rem 0.9rem;
+      color: #8090a8;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    tbody tr:nth-child(odd)  { background: #141924; }
+    tbody tr:nth-child(even) { background: #111520; }
+    tbody tr:hover           { background: #1e2838; }
+
+    td {
+      padding: 0.6rem 0.9rem;
+      vertical-align: top;
+      border-top: 1px solid #1e2838;
+    }
+
+    /* ── Status badges ─────────────────────────────────────────────── */
+    .badge {
+      display: inline-block;
+      padding: 0.2em 0.6em;
+      border-radius: 4px;
+      font-size: 0.8rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .badge-completed           { background: #1a3d2a; color: #4caf7d; }
+    .badge-completed_with_errors { background: #3d3010; color: #d4a930; }
+    .badge-running             { background: #1a2a3d; color: #5b9bd5; }
+    .badge-failed              { background: #3d1a1a; color: #e05555; }
+    .badge-unknown             { background: #2a2a2a; color: #888; }
+
+    /* ── Error cell ────────────────────────────────────────────────── */
+    .error-text {
+      font-size: 0.78rem;
+      color: #e05555;
+      white-space: pre-wrap;
+      max-height: 6rem;
+      overflow-y: auto;
+    }
+
+    /* ── Empty state ───────────────────────────────────────────────── */
+    .empty {
+      text-align: center;
+      padding: 3rem 1rem;
+      color: #4a5a6a;
+      font-size: 0.95rem;
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+
+  <header>
+    <h1>🎬 Kodi <span>Only</span> Scans</h1>
+    <div>
+      <button id="scanBtn" onclick="triggerScan()">▶ Scan Now</button>
+      <div id="statusMsg"></div>
+    </div>
+  </header>
+
+  <h2>Scan History</h2>
+
+  {% if history %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Started</th>
+          <th>Finished</th>
+          <th>Status</th>
+          <th>Movies</th>
+          <th>Episodes</th>
+          <th>Errors</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in history %}
+        <tr>
+          <td>{{ row.id }}</td>
+          <td>{{ row.started_at | replace("T", " ") | truncate(19, True, "") }}</td>
+          <td>
+            {% if row.finished_at %}
+              {{ row.finished_at | replace("T", " ") | truncate(19, True, "") }}
+            {% else %}
+              <em style="color:#4a5a6a">—</em>
+            {% endif %}
+          </td>
+          <td>
+            {% set badge_class = {
+                "completed":               "badge-completed",
+                "completed_with_errors":   "badge-completed_with_errors",
+                "running":                 "badge-running",
+                "failed":                  "badge-failed"
+            }.get(row.status, "badge-unknown") %}
+            <span class="badge {{ badge_class }}">{{ row.status }}</span>
+          </td>
+          <td>{{ row.movies_added }}</td>
+          <td>{{ row.episodes_added }}</td>
+          <td>
+            {% if row.errors %}
+              <div class="error-text">{{ row.errors }}</div>
+            {% else %}
+              <em style="color:#4a5a6a">none</em>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">No scans recorded yet. Click <strong>Scan Now</strong> to begin.</div>
+  {% endif %}
+
+</div>
+
+<script>
+  async function triggerScan() {
+    const btn = document.getElementById("scanBtn");
+    const msg = document.getElementById("statusMsg");
+
+    btn.disabled = true;
+    msg.textContent = "⏳ Scan triggered – running in background…";
+
+    try {
+      const resp = await fetch("/scan", { method: "POST" });
+      const data = await resp.json();
+      msg.textContent = "✅ " + (data.status ?? "Scan started");
+    } catch (err) {
+      msg.textContent = "❌ Failed to trigger scan: " + err;
+    } finally {
+      // Re-enable button after a short delay and refresh history
+      setTimeout(() => {
+        btn.disabled = false;
+        window.location.reload();
+      }, 3000);
+    }
+  }
+</script>
+</body>
+</html>
