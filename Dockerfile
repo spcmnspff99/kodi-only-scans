@@ -1,5 +1,7 @@
 FROM python:3.11-slim
 
+ENV TZ=America/Boise
+
 # Install system dependencies required by smbprotocol (Kerberos / GSSAPI headers)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \

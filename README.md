@@ -4,7 +4,7 @@ A lightweight Docker service that walks an SMB/NAS share, parses Kodi-compatible
 
 ## Features
 
-- **Scheduled scanning** via a configurable cron expression (default: daily at 04:00 UTC)
+- **Scheduled scanning** via a configurable cron expression (default: daily at 04:00 America/Boise local time)
 - **On-demand scans** triggered through the web dashboard or REST API
 - **Kodi-compatible JSON-RPC** support for `VideoLibrary.Scan`
 - **Movie & TV support** — processes both `Movies` and `TV` library paths on your share
@@ -42,7 +42,7 @@ DB_PASS=kodipass
 DB_NAME=MyVideos131         # Match your Kodi DB version (e.g. MyVideos131)
 
 # Scheduler – standard 5-field cron (minute hour dom month dow)
-SCAN_CRON=0 4 * * *         # Default: daily at 04:00 UTC
+SCAN_CRON=0 4 * * *         # Default: daily at 04:00 America/Boise local time
 
 # Path inside the container for the SQLite history DB
 HISTORY_DB=/data/scan_history.db

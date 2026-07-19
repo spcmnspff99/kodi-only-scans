@@ -6,9 +6,11 @@ services:
     container_name: kodi-only-scans
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "8282:8080"
     env_file:
       - .env
+    environment:
+      TZ: America/Boise
     volumes:
       - scanner-data:/data
     # Optional: run an initial scan immediately on startup
