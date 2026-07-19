@@ -140,6 +140,52 @@ def _episode_exists(conn, idFile: int) -> bool:
         return cur.fetchone() is not None
 
 
+def _get_episode_id_by_file(conn, idFile: int) -> Optional[int]:
+    with conn.cursor() as cur:
+        cur.execute("SELECT idEpisode FROM episode WHERE idFile = %s", (idFile,))
+        row = cur.fetchone()
+        return int(row["idEpisode"]) if row else None
+
+
+def _get_episode_row_by_file(conn, idFile: int) -> Optional[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT idEpisode, idShow, idSeason, c00, c01, c02, c04, c05, c06,
+                   c10, c11, c12, c13, c18
+            FROM episode
+            WHERE idFile = %s
+            """,
+            (idFile,),
+        )
+        return cur.fetchone()
+
+
+def _episode_row_matches(
+    row: dict,
+    idShow: int,
+    idSeason: int,
+    season_num: int,
+    episode_num: int,
+    nfo: EpisodeNfo,
+) -> bool:
+    return (
+        int(row["idShow"]) == idShow
+        and int(row["idSeason"]) == idSeason
+        and (row["c00"] or "") == nfo.title
+        and (row["c01"] or "") == nfo.outline
+        and (row["c02"] or "") == nfo.plot
+        and (row["c04"] or "") == " / ".join(nfo.writer)
+        and (row["c05"] or "") == nfo.aired
+        and (row["c06"] or "") == nfo.thumb
+        and str(row["c10"] or "") == str(episode_num)
+        and (row["c11"] or "") == nfo.tvdb_id
+        and str(row["c12"] or "") == str(season_num)
+        and str(row["c13"] or "") == str(episode_num)
+        and (row["c18"] or "") == " / ".join(nfo.director)
+    )
+
+
 def _get_or_create_season(conn, idShow: int, season_number: int) -> int:
     """Return idSeason for *(idShow, season_number)*, inserting when absent."""
     with conn.cursor() as cur:
@@ -314,14 +360,15 @@ def upsert_episode(
     """Idempotently insert an episode into Kodi's database.
 
     Returns the new ``idEpisode`` if a row was inserted, ``None`` if it already
-    existed.
+    existed and required no update.
 
     Mapping:
         c00 = title          c01 = outline
         c02 = plot           c04 = writer
         c05 = aired          c06 = thumb
-        c09 = season number  c10 = episode number
-        c11 = TVDB unique id c18 = director
+        c10 = episode number  c11 = TVDB unique id
+        c12 = season number   c13 = episode number
+        c18 = director
     """
     with transaction(conn):
         try:
@@ -329,23 +376,76 @@ def upsert_episode(
         except (ValueError, TypeError):
             season_num = 0
 
+        try:
+            episode_num = int(nfo.episode)
+        except (ValueError, TypeError):
+            episode_num = 0
+
         idPath = _get_or_create_path(conn, episode_directory_uri)
         idFile = _get_or_create_file(conn, idPath, filename)
-        if _episode_exists(conn, idFile):
-            return None
-
         idSeason = _get_or_create_season(conn, idShow, season_num)
+
+        existing_row = _get_episode_row_by_file(conn, idFile)
+        if existing_row is not None:
+            if _episode_row_matches(existing_row, idShow, idSeason, season_num, episode_num, nfo):
+                return None
+
+            existing_id = int(existing_row["idEpisode"])
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE episode
+                    SET idShow = %s,
+                        idSeason = %s,
+                        c00 = %s,
+                        c01 = %s,
+                        c02 = %s,
+                        c04 = %s,
+                        c05 = %s,
+                        c06 = %s,
+                        c10 = %s,
+                        c11 = %s,
+                        c12 = %s,
+                        c13 = %s,
+                        c18 = %s
+                    WHERE idEpisode = %s
+                    """,
+                    (
+                        idShow,
+                        idSeason,
+                        nfo.title,
+                        nfo.outline,
+                        nfo.plot,
+                        " / ".join(nfo.writer),
+                        nfo.aired,
+                        nfo.thumb,
+                        str(episode_num),
+                        nfo.tvdb_id,
+                        str(season_num),
+                        str(episode_num),
+                        " / ".join(nfo.director),
+                        existing_id,
+                    ),
+                )
+            logger.debug(
+                "Updated episode idEpisode=%d S%sE%s title=%r",
+                existing_id,
+                season_num,
+                episode_num,
+                nfo.title,
+            )
+            return None
 
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO episode
                     (idFile, idShow, idSeason,
-                     c00, c01, c02, c04, c05, c06, c09, c10, c11, c18,
+                     c00, c01, c02, c04, c05, c06, c10, c11, c12, c13, c18,
                      userrating)
                 VALUES
                     (%s, %s, %s,
-                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                      0)
                 """,
                 (
@@ -356,9 +456,10 @@ def upsert_episode(
                     " / ".join(nfo.writer),             # c04
                     nfo.aired,                          # c05
                     nfo.thumb,                          # c06
-                    nfo.season,                         # c09
-                    nfo.episode,                        # c10
+                    str(episode_num),                   # c10
                     nfo.tvdb_id,                        # c11
+                    str(season_num),                    # c12
+                    str(episode_num),                   # c13
                     " / ".join(nfo.director),           # c18
                 ),
             )

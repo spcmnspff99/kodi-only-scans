@@ -6,6 +6,7 @@ A lightweight Docker service that walks an SMB/NAS share, parses Kodi-compatible
 
 - **Scheduled scanning** via a configurable cron expression (default: daily at 04:00 UTC)
 - **On-demand scans** triggered through the web dashboard or REST API
+- **Kodi-compatible JSON-RPC** support for `VideoLibrary.Scan`
 - **Movie & TV support** — processes both `Movies` and `TV` library paths on your share
 - **NFO parsing** — reads Kodi `.nfo` sidecar files for metadata (title, year, plot, ratings, etc.)
 - **Scan history** — persists scan results (movies added, episodes added, errors) to a local SQLite database
@@ -67,8 +68,11 @@ The web dashboard will be available at `http://<host>:8080`.
 | Method | Path            | Description                                      |
 |--------|-----------------|--------------------------------------------------|
 | `GET`  | `/`             | HTML dashboard showing scan history              |
-| `POST` | `/scan`         | Trigger an immediate scan (returns `202`)        |
+| `POST` | `/scan`         | Trigger a scan; optionally pass `path`/`directory`|
+| `POST` | `/jsonrpc`      | Kodi-compatible `VideoLibrary.Scan` endpoint     |
 | `GET`  | `/api/history`  | Scan history as JSON (last 50 runs)              |
+
+`/scan` and `/jsonrpc` both accept a target path. If a file path is provided, the scanner automatically scans the containing folder instead of only the file path itself.
 
 ## Project Structure
 

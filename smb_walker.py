@@ -15,6 +15,7 @@ Usage
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Iterator, List, Optional
 
@@ -101,6 +102,122 @@ def list_smb_subdirs(unc_path: str) -> List[str]:
     except Exception as exc:
         logger.warning("Cannot list subdirs of %s: %s", unc_path, exc)
         return []
+
+
+def smb_dir_exists(unc_path: str) -> bool:
+    """Return ``True`` if *unc_path* can be listed as a directory."""
+    try:
+        list(smbclient.scandir(unc_path))
+        return True
+    except Exception:
+        return False
+
+
+def resolve_share_path(
+    server: str,
+    share: str,
+    configured_path: str,
+    library_type: str,
+) -> str:
+    """Resolve a configured share path to an existing directory.
+
+    Resolution strategy:
+    1. Direct path lookup (as configured).
+    2. Segment-by-segment case-insensitive / punctuation-insensitive matching.
+    3. Root-level alias guess for common library names.
+
+    Returns the best relative path inside the share. If no match can be found,
+    returns the original configured path unchanged.
+    """
+    rel = configured_path.strip("/\\")
+    if not rel:
+        return rel
+
+    direct_unc = build_unc(server, share, rel)
+    if smb_dir_exists(direct_unc):
+        return rel
+
+    # Try segment-by-segment matching in case only case/spaces/underscores differ.
+    resolved_segments: List[str] = []
+    configured_segments = [p for p in rel.replace("\\", "/").split("/") if p]
+    for segment in configured_segments:
+        parent_rel = "/".join(resolved_segments)
+        parent_unc = build_unc(server, share, parent_rel)
+        candidates = list_smb_subdirs(parent_unc)
+        match = _pick_matching_segment(segment, candidates)
+        if not match:
+            resolved_segments = []
+            break
+        resolved_segments.append(match)
+
+    if resolved_segments:
+        resolved_rel = "/".join(resolved_segments)
+        if smb_dir_exists(build_unc(server, share, resolved_rel)):
+            logger.info("Resolved SMB path %r -> %r", configured_path, resolved_rel)
+            return resolved_rel
+
+    # Alias fallback is intentionally conservative and only used for single-segment
+    # configured paths to avoid accidentally remapping deep custom structures.
+    if len(configured_segments) == 1:
+        root_dirs = list_smb_subdirs(build_unc(server, share, ""))
+        guessed = _guess_library_root(root_dirs, library_type)
+        if guessed:
+            logger.info("Guessed SMB %s path %r -> %r", library_type, configured_path, guessed)
+            return guessed
+
+    return rel
+
+
+def _pick_matching_segment(segment: str, candidates: List[str]) -> Optional[str]:
+    seg_lower = segment.lower()
+    for c in candidates:
+        if c.lower() == seg_lower:
+            return c
+
+    seg_norm = _normalize_name(segment)
+    normalized_matches = [c for c in candidates if _normalize_name(c) == seg_norm]
+    if len(normalized_matches) == 1:
+        return normalized_matches[0]
+    return None
+
+
+def _guess_library_root(root_dirs: List[str], library_type: str) -> Optional[str]:
+    if not root_dirs:
+        return None
+
+    aliases = {
+        "movies": ["movies", "movie", "films", "film"],
+        "tv": ["tv", "tvshow", "tvshows", "shows", "series", "television"],
+    }.get(library_type.lower(), [])
+    if not aliases:
+        return None
+
+    alias_norms = {_normalize_name(a) for a in aliases}
+    scored: List[tuple[int, str]] = []
+
+    for name in root_dirs:
+        norm = _normalize_name(name)
+        score = 0
+        if norm in alias_norms:
+            score = 3
+        elif any(alias in norm for alias in alias_norms):
+            score = 2
+        if score:
+            scored.append((score, name))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score = scored[0][0]
+    best_names = [name for score, name in scored if score == best_score]
+    if len(best_names) == 1:
+        return best_names[0]
+    return None
+
+
+def _normalize_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
 
 
 # ---------------------------------------------------------------------------

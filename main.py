@@ -21,10 +21,12 @@ Environment variables (see .env.example)
 import asyncio
 import logging
 import os
+import posixpath
 import sqlite3
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from typing import Optional
 
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -43,6 +45,8 @@ from smb_walker import (
     build_unc,
     list_smb_subdirs,
     read_smb_file,
+    resolve_share_path,
+    smb_dir_exists,
     setup_smb_session,
     walk_videos,
 )
@@ -63,6 +67,8 @@ logger = logging.getLogger(__name__)
 
 SMB_HOST = os.environ.get("SMB_HOST", "")
 SMB_SHARE = os.environ.get("SMB_SHARE", "")
+SMB_MOVIES_SHARE = os.environ.get("SMB_MOVIES_SHARE", SMB_SHARE)
+SMB_TV_SHARE = os.environ.get("SMB_TV_SHARE", SMB_SHARE)
 SMB_USER = os.environ.get("SMB_USER", "guest")
 SMB_PASS = os.environ.get("SMB_PASS", "")
 SMB_PORT = int(os.environ.get("SMB_PORT", "445"))
@@ -77,6 +83,83 @@ DB_NAME = os.environ.get("DB_NAME", "MyVideos131")
 
 SCAN_CRON = os.environ.get("SCAN_CRON", "0 4 * * *")
 HISTORY_DB = os.environ.get("HISTORY_DB", "/data/scan_history.db")
+
+
+def _normalize_target_path(target_path: str) -> str:
+    target_path = target_path.strip().strip('"').strip("'")
+    target_path = target_path.split("?", 1)[0].split("#", 1)[0]
+    return target_path.replace("\\", "/")
+
+
+def _looks_like_file_path(path_value: str) -> bool:
+    filename = posixpath.basename(path_value.rstrip("/"))
+    return bool(filename) and bool(posixpath.splitext(filename)[1])
+
+
+def _relative_path_after_share(target_path: str, share_name: str) -> Optional[str]:
+    normalized = _normalize_target_path(target_path)
+    parts = [part for part in normalized.split("/") if part]
+    share_index = next((idx for idx, part in enumerate(parts) if part.lower() == share_name.lower()), None)
+    if share_index is None:
+        return None
+
+    rel_parts = parts[share_index + 1 :]
+    if rel_parts and _looks_like_file_path(rel_parts[-1]):
+        rel_parts = rel_parts[:-1]
+    return "/".join(rel_parts)
+
+
+def _find_tv_show_root_rel(tv_share: str, scan_rel: str) -> str:
+    current_rel = scan_rel.strip("/\\")
+    while True:
+        tvshow_nfo_rel = f"{current_rel}/tvshow.nfo" if current_rel else "tvshow.nfo"
+        if read_smb_file(build_unc(SMB_HOST, tv_share, tvshow_nfo_rel)):
+            return current_rel
+        if not current_rel:
+            return scan_rel.strip("/\\")
+        current_rel = posixpath.dirname(current_rel)
+        if current_rel == ".":
+            current_rel = ""
+
+
+def _resolve_scan_target(target_path: str) -> Optional[dict]:
+    """Resolve a Sonarr/Radarr/Kodi target path to a library share and scan root."""
+    if not target_path:
+        return None
+
+    for share_name, library_type in (
+        (SMB_MOVIES_SHARE, "movies"),
+        (SMB_TV_SHARE, "tv"),
+    ):
+        if not share_name:
+            continue
+
+        rel_path = _relative_path_after_share(target_path, share_name)
+        if rel_path is None:
+            continue
+
+        scan_rel = rel_path.strip("/\\")
+        if scan_rel and _looks_like_file_path(scan_rel):
+            scan_rel = posixpath.dirname(scan_rel)
+            if scan_rel == ".":
+                scan_rel = ""
+
+        if library_type == "tv":
+            show_root_rel = _find_tv_show_root_rel(share_name, scan_rel)
+            return {
+                "library_type": library_type,
+                "share": share_name,
+                "scan_rel": scan_rel,
+                "show_root_rel": show_root_rel,
+            }
+
+        return {
+            "library_type": library_type,
+            "share": share_name,
+            "scan_rel": scan_rel,
+        }
+
+    return None
 
 # ---------------------------------------------------------------------------
 # Scan history (SQLite)
@@ -166,7 +249,7 @@ def get_history() -> list:
 # Scan engine
 # ---------------------------------------------------------------------------
 
-def run_scan() -> None:
+def _legacy_run_scan() -> None:
     """
     Full media-library scan.  Runs synchronously; intended to be called from
     a background thread or the APScheduler executor.
@@ -193,15 +276,41 @@ def run_scan() -> None:
         # ── SMB session ────────────────────────────────────────────────────
         setup_smb_session(SMB_HOST, SMB_USER, SMB_PASS, SMB_PORT)
 
+        if not SMB_MOVIES_SHARE:
+            errors.append("SMB_MOVIES_SHARE (or SMB_SHARE) must be set")
+        if not SMB_TV_SHARE:
+            errors.append("SMB_TV_SHARE (or SMB_SHARE) must be set")
+
+        movies_path = resolve_share_path(
+            SMB_HOST, SMB_MOVIES_SHARE, SMB_MOVIES_PATH, library_type="movies"
+        )
+        tv_path = resolve_share_path(
+            SMB_HOST, SMB_TV_SHARE, SMB_TV_PATH, library_type="tv"
+        )
+
+        if movies_path != SMB_MOVIES_PATH:
+            logger.info("Using resolved movies path: %s (configured: %s)", movies_path, SMB_MOVIES_PATH)
+        if tv_path != SMB_TV_PATH:
+            logger.info("Using resolved TV path: %s (configured: %s)", tv_path, SMB_TV_PATH)
+
+        if not smb_dir_exists(build_unc(SMB_HOST, SMB_MOVIES_SHARE, movies_path)):
+            msg = f"Movies path not found on share: {movies_path}"
+            logger.warning(msg)
+            errors.append(msg)
+        if not smb_dir_exists(build_unc(SMB_HOST, SMB_TV_SHARE, tv_path)):
+            msg = f"TV path not found on share: {tv_path}"
+            logger.warning(msg)
+            errors.append(msg)
+
         # ── DB connection ──────────────────────────────────────────────────
         db_conn = get_connection(DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME)
 
         try:
             # ── Movies ─────────────────────────────────────────────────────
             logger.info(
-                "Scanning movies: smb://%s/%s/%s", SMB_HOST, SMB_SHARE, SMB_MOVIES_PATH
+                "Scanning movies: smb://%s/%s/%s", SMB_HOST, SMB_MOVIES_SHARE, movies_path
             )
-            for vf in walk_videos(SMB_HOST, SMB_SHARE, SMB_MOVIES_PATH):
+            for vf in walk_videos(SMB_HOST, SMB_MOVIES_SHARE, movies_path):
                 try:
                     result = _process_movie(db_conn, vf)
                     if result is not None:
@@ -213,13 +322,13 @@ def run_scan() -> None:
 
             # ── TV shows ───────────────────────────────────────────────────
             logger.info(
-                "Scanning TV: smb://%s/%s/%s", SMB_HOST, SMB_SHARE, SMB_TV_PATH
+                "Scanning TV: smb://%s/%s/%s", SMB_HOST, SMB_TV_SHARE, tv_path
             )
-            tv_unc = build_unc(SMB_HOST, SMB_SHARE, SMB_TV_PATH)
+            tv_unc = build_unc(SMB_HOST, SMB_TV_SHARE, tv_path)
             for show_name in list_smb_subdirs(tv_unc):
-                show_rel = f"{SMB_TV_PATH.rstrip('/')}/{show_name}"
-                show_uri = build_smb_dir_uri(SMB_HOST, SMB_SHARE, show_rel)
-                ep_count = _process_tvshow(db_conn, show_name, show_rel, show_uri, errors)
+                show_rel = f"{tv_path.rstrip('/')}/{show_name}"
+                show_uri = build_smb_dir_uri(SMB_HOST, SMB_TV_SHARE, show_rel)
+                ep_count = _process_tvshow(db_conn, SMB_TV_SHARE, show_name, show_rel, show_uri, errors)
                 episodes_added += ep_count
 
         finally:
@@ -240,6 +349,151 @@ def run_scan() -> None:
     )
 
 
+def run_scan(target_path: str | None = None) -> None:
+    """Full scan by default, or a targeted scan when *target_path* is provided."""
+    if not SMB_HOST or not DB_HOST:
+        logger.warning("SMB_HOST or DB_HOST not configured – scan skipped.")
+        return
+
+    scan_id = _start_scan_record()
+    movies_added = 0
+    episodes_added = 0
+    errors: list = []
+
+    try:
+        setup_smb_session(SMB_HOST, SMB_USER, SMB_PASS, SMB_PORT)
+
+        if not SMB_MOVIES_SHARE:
+            errors.append("SMB_MOVIES_SHARE (or SMB_SHARE) must be set")
+        if not SMB_TV_SHARE:
+            errors.append("SMB_TV_SHARE (or SMB_SHARE) must be set")
+
+        target = _resolve_scan_target(target_path) if target_path else None
+
+        db_conn = get_connection(DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME)
+        try:
+            if target is None:
+                movies_path = resolve_share_path(
+                    SMB_HOST, SMB_MOVIES_SHARE, SMB_MOVIES_PATH, library_type="movies"
+                )
+                tv_path = resolve_share_path(
+                    SMB_HOST, SMB_TV_SHARE, SMB_TV_PATH, library_type="tv"
+                )
+
+                if movies_path != SMB_MOVIES_PATH:
+                    logger.info("Using resolved movies path: %s (configured: %s)", movies_path, SMB_MOVIES_PATH)
+                if tv_path != SMB_TV_PATH:
+                    logger.info("Using resolved TV path: %s (configured: %s)", tv_path, SMB_TV_PATH)
+
+                if not smb_dir_exists(build_unc(SMB_HOST, SMB_MOVIES_SHARE, movies_path)):
+                    msg = f"Movies path not found on share: {movies_path}"
+                    logger.warning(msg)
+                    errors.append(msg)
+                if not smb_dir_exists(build_unc(SMB_HOST, SMB_TV_SHARE, tv_path)):
+                    msg = f"TV path not found on share: {tv_path}"
+                    logger.warning(msg)
+                    errors.append(msg)
+
+                movies_added += _scan_movies_tree(db_conn, SMB_MOVIES_SHARE, movies_path, errors)
+                episodes_added += _scan_tv_library(db_conn, SMB_TV_SHARE, tv_path, errors)
+            else:
+                logger.info("Targeted scan requested: %s", target_path)
+                if target["library_type"] == "movies":
+                    scan_rel = resolve_share_path(
+                        SMB_HOST, target["share"], target["scan_rel"], library_type="movies"
+                    )
+                    movies_added += _scan_movies_tree(db_conn, target["share"], scan_rel, errors)
+                else:
+                    scan_rel = resolve_share_path(
+                        SMB_HOST, target["share"], target["scan_rel"], library_type="tv"
+                    )
+                    show_root_rel = target["show_root_rel"]
+                    show_name = posixpath.basename(show_root_rel.rstrip("/\\")) if show_root_rel else ""
+                    episodes_added += _process_tvshow(
+                        db_conn,
+                        target["share"],
+                        show_name,
+                        show_root_rel,
+                        scan_rel,
+                        build_smb_dir_uri(SMB_HOST, target["share"], show_root_rel),
+                        errors,
+                    )
+
+        finally:
+            db_conn.close()
+
+    except Exception as exc:
+        msg = f"Fatal scan error: {exc}\n{traceback.format_exc()}"
+        logger.error(msg)
+        errors.append(msg)
+        _finish_scan_record(scan_id, "failed", movies_added, episodes_added, "\n".join(errors))
+        return
+
+    status = "completed" if not errors else "completed_with_errors"
+    _finish_scan_record(scan_id, status, movies_added, episodes_added, "\n".join(errors))
+    logger.info(
+        "Scan finished – %d movies, %d episodes added. Status: %s",
+        movies_added, episodes_added, status,
+    )
+
+
+async def _extract_target_path(request: Request) -> Optional[str]:
+    """Extract a target path from query params or a JSON body."""
+    for key in ("path", "directory", "file", "target"):
+        value = request.query_params.get(key)
+        if value:
+            return value
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("path", "directory", "file", "target"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+
+    params = payload.get("params")
+    if isinstance(params, dict):
+        for key in ("path", "directory", "file", "target"):
+            value = params.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+
+    return None
+
+
+def _scan_movies_tree(db_conn, movies_share: str, movies_path: str, errors: list) -> int:
+    logger.info("Scanning movies: smb://%s/%s/%s", SMB_HOST, movies_share, movies_path)
+    movies_added = 0
+    for vf in walk_videos(SMB_HOST, movies_share, movies_path):
+        try:
+            result = _process_movie(db_conn, vf)
+            if result is not None:
+                movies_added += 1
+        except Exception as exc:
+            msg = f"Movie {vf.filename}: {exc}"
+            logger.warning(msg)
+            errors.append(msg)
+    return movies_added
+
+
+def _scan_tv_library(db_conn, tv_share: str, tv_path: str, errors: list) -> int:
+    logger.info("Scanning TV: smb://%s/%s/%s", SMB_HOST, tv_share, tv_path)
+    episodes_added = 0
+    tv_unc = build_unc(SMB_HOST, tv_share, tv_path)
+    for show_name in list_smb_subdirs(tv_unc):
+        show_rel = f"{tv_path.rstrip('/')}/{show_name}"
+        show_uri = build_smb_dir_uri(SMB_HOST, tv_share, show_rel)
+        ep_count = _process_tvshow(db_conn, tv_share, show_name, show_rel, show_rel, show_uri, errors)
+        episodes_added += ep_count
+    return episodes_added
+
+
 def _process_movie(db_conn, vf: VideoFile):
     """Parse .nfo and upsert movie.  Returns idMovie or None."""
     if not vf.nfo_unc:
@@ -258,22 +512,24 @@ def _process_movie(db_conn, vf: VideoFile):
 
 def _process_tvshow(
     db_conn,
+    tv_share: str,
     show_name: str,
-    show_rel: str,
+    show_root_rel: str,
+    scan_rel: str,
     show_uri: str,
     errors: list,
 ) -> int:
     """Process a single TV show directory.  Returns number of new episodes."""
     # Read tvshow.nfo
-    tvshow_nfo_unc = build_unc(SMB_HOST, SMB_SHARE, f"{show_rel}/tvshow.nfo")
+    tvshow_nfo_unc = build_unc(SMB_HOST, tv_share, f"{show_root_rel}/tvshow.nfo")
     content = read_smb_file(tvshow_nfo_unc)
     if not content:
-        logger.debug("No tvshow.nfo in %s – skipping", show_rel)
+        logger.debug("No tvshow.nfo in %s – skipping", show_root_rel)
         return 0
 
     show_nfo = parse_tvshow_nfo(content)
     if not show_nfo or not show_nfo.title:
-        logger.debug("Invalid tvshow.nfo in %s – skipping", show_rel)
+        logger.debug("Invalid tvshow.nfo in %s – skipping", show_root_rel)
         return 0
 
     try:
@@ -287,7 +543,7 @@ def _process_tvshow(
     logger.info("TV show: %r (idShow=%d)", show_nfo.title, idShow)
 
     episodes_added = 0
-    for vf in walk_videos(SMB_HOST, SMB_SHARE, show_rel):
+    for vf in walk_videos(SMB_HOST, tv_share, scan_rel):
         try:
             if not vf.nfo_unc:
                 continue
@@ -365,10 +621,33 @@ async def dashboard(request: Request):
 
 
 @app.post("/scan")
-async def trigger_scan(background_tasks: BackgroundTasks):
+async def trigger_scan(request: Request, background_tasks: BackgroundTasks):
     """Kick off an immediate scan as a FastAPI background task."""
-    background_tasks.add_task(run_scan)
-    return JSONResponse({"status": "scan triggered"}, status_code=202)
+    target_path = await _extract_target_path(request)
+    background_tasks.add_task(run_scan, target_path)
+    payload = {"status": "scan triggered"}
+    if target_path:
+        payload["target_path"] = target_path
+    return JSONResponse(payload, status_code=202)
+
+
+@app.post("/jsonrpc")
+async def kodi_jsonrpc(request: Request, background_tasks: BackgroundTasks):
+    """Kodi-compatible JSON-RPC surface for VideoLibrary.Scan."""
+    payload = await request.json()
+    method = payload.get("method")
+    request_id = payload.get("id")
+
+    if method != "VideoLibrary.Scan":
+        return JSONResponse(
+            {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Method not found"}},
+            status_code=200,
+        )
+
+    params = payload.get("params") or {}
+    target_path = params.get("directory") or params.get("path") or params.get("file") or params.get("target")
+    background_tasks.add_task(run_scan, target_path)
+    return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": "OK"}, status_code=200)
 
 
 @app.get("/api/history")
