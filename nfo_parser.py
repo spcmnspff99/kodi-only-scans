@@ -10,6 +10,7 @@ Supported root tags
 """
 
 import xml.etree.ElementTree as ET
+import re
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -77,6 +78,12 @@ class EpisodeNfo:
     director: List[str] = field(default_factory=list)
     writer: List[str] = field(default_factory=list)
     thumb: str = ""
+
+
+@dataclass
+class MovieGuess:
+    title: str = ""
+    year: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -213,3 +220,17 @@ def parse_episode_nfo(content: str) -> Optional[EpisodeNfo]:
         nfo.thumb = (thumb_el.text or "").strip()
 
     return nfo
+
+
+def guess_movie_from_filename(filename: str) -> Optional[MovieGuess]:
+    """Guess a movie title/year from a filename or folder name."""
+    stem = re.sub(r"\.[^.]+$", "", filename).strip()
+    match = re.match(r"^(?P<title>.+?) \((?P<year>\d{4})\)", stem)
+    if not match:
+        return None
+
+    title = match.group("title").replace(".", " ").replace("_", " ").strip()
+    year = match.group("year")
+    if not title:
+        return None
+    return MovieGuess(title=title, year=year)

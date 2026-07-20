@@ -44,6 +44,7 @@ class VideoFile:
     filename: str           # file.mkv
     unc_dir: str            # \\server\share\path\to  (smbclient directory operations)
     nfo_unc: Optional[str]  # \\server\share\path\to\file.nfo, or None if absent
+    poster_unc: Optional[str]  # \\server\share\path\to\poster.jpg, or None if absent
 
 
 # ---------------------------------------------------------------------------
@@ -264,8 +265,25 @@ def _walk(server: str, share: str, unc_dir: str) -> Iterator[VideoFile]:
             continue
 
         stem = os.path.splitext(fname)[0]
-        nfo_name = stem + ".nfo"
-        nfo_unc = f"{unc_dir}\\{nfo_name}" if nfo_name in file_names else None
+        nfo_unc = None
+        nfo_candidates = [name for name in file_names if name.lower().endswith(".nfo")]
+        stem_nfo_name = stem + ".nfo"
+        if stem_nfo_name in file_names:
+            nfo_unc = f"{unc_dir}\\{stem_nfo_name}"
+        elif len(nfo_candidates) == 1:
+            nfo_unc = f"{unc_dir}\\{nfo_candidates[0]}"
+        elif nfo_candidates:
+            preferred_nfo = sorted(
+                nfo_candidates,
+                key=lambda name: 0 if os.path.splitext(name)[0].lower() == stem.lower() else 1,
+            )[0]
+            nfo_unc = f"{unc_dir}\\{preferred_nfo}"
+
+        poster_unc = None
+        for art_name in ("poster.jpg", "poster.jpeg", "folder.jpg", "folder.jpeg"):
+            if art_name in file_names:
+                poster_unc = f"{unc_dir}\\{art_name}"
+                break
 
         dir_smb_uri = _unc_to_smb_dir_uri(server, share, unc_dir)
 
@@ -276,6 +294,7 @@ def _walk(server: str, share: str, unc_dir: str) -> Iterator[VideoFile]:
             filename=fname,
             unc_dir=unc_dir,
             nfo_unc=nfo_unc,
+            poster_unc=poster_unc,
         )
 
     # Recurse
@@ -299,6 +318,11 @@ def _unc_to_smb_dir_uri(server: str, share: str, unc_dir: str) -> str:
         return f"smb://{server}/{share}/{rel}/"
     return f"smb://{server}/{share}/"
 
+
+def build_smb_file_uri(server: str, share: str, path: str) -> str:
+    """Convert a share-relative path to a Kodi-style smb:// file URI."""
+    clean_path = path.strip("/")
+    return f"smb://{server}/{share}/{clean_path}" if clean_path else f"smb://{server}/{share}"
 
 def build_unc(server: str, share: str, path: str) -> str:
     """Build a UNC path from server, share, and a relative path string."""

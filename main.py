@@ -37,11 +37,12 @@ from fastapi.templating import Jinja2Templates
 
 import smbclient
 
-from db_ops import get_connection, get_or_create_tvshow, upsert_episode, upsert_movie
-from nfo_parser import parse_episode_nfo, parse_movie_nfo, parse_tvshow_nfo
+from db_ops import dedupe_movies, get_connection, get_or_create_tvshow, upsert_episode, upsert_movie
+from nfo_parser import MovieNfo, guess_movie_from_filename, parse_episode_nfo, parse_movie_nfo, parse_tvshow_nfo
 from smb_walker import (
     VideoFile,
     build_smb_dir_uri,
+    build_smb_file_uri,
     build_unc,
     list_smb_subdirs,
     read_smb_file,
@@ -363,6 +364,10 @@ def _legacy_run_scan() -> None:
                 ep_count = _process_tvshow(db_conn, SMB_TV_SHARE, show_name, show_rel, show_uri, errors)
                 episodes_added += ep_count
 
+            removed = dedupe_movies(db_conn)
+            if removed:
+                logger.info("Removed %d duplicate movie rows", removed)
+
         finally:
             db_conn.close()
 
@@ -451,6 +456,10 @@ def run_scan(target_path: str | None = None) -> None:
                         errors,
                     )
 
+            removed = dedupe_movies(db_conn)
+            if removed:
+                logger.info("Removed %d duplicate movie rows", removed)
+
         finally:
             db_conn.close()
 
@@ -528,14 +537,25 @@ def _scan_tv_library(db_conn, tv_share: str, tv_path: str, errors: list) -> int:
 
 def _process_movie(db_conn, vf: VideoFile):
     """Parse .nfo and upsert movie.  Returns idMovie or None."""
-    if not vf.nfo_unc:
-        return None
-    content = read_smb_file(vf.nfo_unc)
-    if not content:
-        return None
-    nfo = parse_movie_nfo(content)
+    nfo = None
+
+    if vf.nfo_unc:
+        content = read_smb_file(vf.nfo_unc)
+        if content:
+            nfo = parse_movie_nfo(content)
+
     if not nfo or not nfo.title:
-        return None
+        guessed = guess_movie_from_filename(vf.filename) or guess_movie_from_filename(vf.directory_uri.rstrip("/").rsplit("/", 1)[-1])
+        if not guessed:
+            return None
+        nfo = MovieNfo(title=guessed.title, year=guessed.year)
+
+    if vf.poster_unc:
+        parts = vf.directory_uri.rstrip("/").split("/")
+        share_name = parts[3] if len(parts) > 3 else SMB_MOVIES_SHARE
+        directory_name = parts[-1]
+        nfo.thumb = build_smb_file_uri(SMB_HOST, share_name, f"{directory_name}/poster.jpg")
+
     result = upsert_movie(db_conn, vf.directory_uri, vf.filename, vf.smb_uri, nfo)
     if result is not None:
         logger.info("Added movie: %r", nfo.title)

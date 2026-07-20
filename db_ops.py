@@ -19,6 +19,7 @@ Private helpers (_prefixed) assume they are called inside an active transaction.
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import re
 from typing import Optional
 
 import pymysql
@@ -134,6 +135,329 @@ def _movie_exists(conn, idFile: int) -> bool:
         return cur.fetchone() is not None
 
 
+def _is_nonempty(value: Optional[str]) -> bool:
+    return bool((value or "").strip())
+
+
+def _movie_year_from_values(year: str, premiered: str) -> str:
+    year = (year or "").strip()
+    if re.fullmatch(r"\d{4}", year):
+        return year
+
+    premiered = (premiered or "").strip()
+    if len(premiered) >= 4 and premiered[:4].isdigit():
+        return premiered[:4]
+    return ""
+
+
+def _movie_year_from_nfo(nfo: MovieNfo) -> str:
+    return _movie_year_from_values(nfo.year, nfo.premiered)
+
+
+def _movie_is_fallback_like(nfo: MovieNfo) -> bool:
+    """Heuristic for guessed metadata: title/year only, everything else empty."""
+    return (
+        _is_nonempty(nfo.title)
+        and _is_nonempty(_movie_year_from_nfo(nfo))
+        and not any(
+            _is_nonempty(v)
+            for v in (
+                nfo.originaltitle,
+                nfo.outline,
+                nfo.plot,
+                nfo.tagline,
+                nfo.premiered,
+                nfo.mpaa,
+                nfo.imdb_id,
+                nfo.thumb,
+            )
+        )
+        and not nfo.genre
+        and not nfo.country
+        and not nfo.director
+        and not nfo.writer
+    )
+
+
+def _movie_row_for_update(conn, idMovie: int) -> Optional[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT idMovie, idFile,
+                   c00, c01, c02, c03, c06, c07, c10, c11, c12, c13, c14, c15, c22,
+                   premiered
+            FROM movie
+            WHERE idMovie = %s
+            """,
+            (idMovie,),
+        )
+        return cur.fetchone()
+
+
+def _find_existing_movie_id(conn, nfo: MovieNfo) -> Optional[int]:
+    """Find an existing movie by stable identity (IMDB, then title+year)."""
+    imdb_id = (nfo.imdb_id or "").strip()
+    with conn.cursor() as cur:
+        if imdb_id:
+            cur.execute(
+                "SELECT idMovie FROM movie WHERE c13 = %s ORDER BY idMovie ASC LIMIT 1",
+                (imdb_id,),
+            )
+            row = cur.fetchone()
+            if row:
+                return int(row["idMovie"])
+
+        title = (nfo.title or "").strip()
+        year = _movie_year_from_nfo(nfo)
+        if title and year:
+            cur.execute(
+                """
+                SELECT idMovie
+                FROM movie
+                WHERE LOWER(TRIM(c00)) = LOWER(TRIM(%s))
+                  AND (
+                        c07 = %s
+                        OR LEFT(COALESCE(premiered, ''), 4) = %s
+                      )
+                ORDER BY idMovie ASC
+                LIMIT 1
+                """,
+                (title, year, year),
+            )
+            row = cur.fetchone()
+            if row:
+                return int(row["idMovie"])
+
+    return None
+
+
+def _build_movie_values_from_nfo(nfo: MovieNfo, full_smb_path: str) -> dict:
+    return {
+        "c00": nfo.title,
+        "c01": nfo.outline,
+        "c02": nfo.plot,
+        "c03": nfo.tagline,
+        "c06": " / ".join(nfo.writer),
+        "c07": nfo.year,
+        "c10": " / ".join(nfo.director),
+        "c11": nfo.originaltitle,
+        "c12": nfo.thumb,
+        "c13": nfo.imdb_id,
+        "c14": " / ".join(nfo.genre),
+        "c15": " / ".join(nfo.country),
+        "c22": full_smb_path,
+        "premiered": nfo.premiered or nfo.year,
+    }
+
+
+def _merged_movie_values(existing_row: dict, nfo: MovieNfo, full_smb_path: str, preserve_existing: bool) -> dict:
+    """Merge incoming values with existing DB row.
+
+    When preserve_existing=True (fallback-like metadata), empty incoming values
+    never overwrite existing populated values.
+    """
+    incoming = _build_movie_values_from_nfo(nfo, full_smb_path)
+    merged = {}
+    for key, new_value in incoming.items():
+        if preserve_existing and not _is_nonempty(new_value):
+            merged[key] = existing_row.get(key) or ""
+        else:
+            merged[key] = new_value
+    return merged
+
+
+def _update_movie_row(conn, idMovie: int, merged_values: dict) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE movie
+            SET c00 = %s,
+                c01 = %s,
+                c02 = %s,
+                c03 = %s,
+                c06 = %s,
+                c07 = %s,
+                c10 = %s,
+                c11 = %s,
+                c12 = %s,
+                c13 = %s,
+                c14 = %s,
+                c15 = %s,
+                c22 = %s,
+                premiered = %s
+            WHERE idMovie = %s
+            """,
+            (
+                merged_values["c00"],
+                merged_values["c01"],
+                merged_values["c02"],
+                merged_values["c03"],
+                merged_values["c06"],
+                merged_values["c07"],
+                merged_values["c10"],
+                merged_values["c11"],
+                merged_values["c12"],
+                merged_values["c13"],
+                merged_values["c14"],
+                merged_values["c15"],
+                merged_values["c22"],
+                merged_values["premiered"],
+                idMovie,
+            ),
+        )
+
+
+def _movie_quality_score(row: dict) -> int:
+    score = 0
+    for key in ("c00", "c01", "c02", "c03", "c06", "c07", "c10", "c11", "c12", "c13", "c14", "c15", "c22", "premiered"):
+        if _is_nonempty(row.get(key)):
+            score += 1
+
+    # Prefer rows that have stable IDs and artwork.
+    if _is_nonempty(row.get("c13")):
+        score += 3
+    if _is_nonempty(row.get("c12")):
+        score += 1
+    return score
+
+
+def _movie_dedupe_key(row: dict) -> Optional[str]:
+    imdb_id = (row.get("c13") or "").strip()
+    if imdb_id:
+        return f"imdb:{imdb_id.lower()}"
+
+    title = (row.get("c00") or "").strip().lower()
+    year = _movie_year_from_values(row.get("c07") or "", row.get("premiered") or "")
+    if title and year:
+        return f"title_year:{title}:{year}"
+    return None
+
+
+def dedupe_movies(conn) -> int:
+    """Remove duplicate movie rows, keeping the most complete record per key.
+
+    Duplicate key priority:
+    1) imdb_id (c13)
+    2) title + year
+    """
+    with transaction(conn):
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT idMovie, idFile,
+                       c00, c01, c02, c03, c06, c07, c10, c11, c12, c13, c14, c15, c22,
+                       premiered
+                FROM movie
+                ORDER BY idMovie ASC
+                """
+            )
+            rows = cur.fetchall() or []
+
+        groups: dict[str, list[dict]] = {}
+        for row in rows:
+            key = _movie_dedupe_key(row)
+            if not key:
+                continue
+            groups.setdefault(key, []).append(row)
+
+        removed = 0
+        for dup_rows in groups.values():
+            if len(dup_rows) < 2:
+                continue
+
+            keep_row = sorted(
+                dup_rows,
+                key=lambda r: (_movie_quality_score(r), -int(r["idMovie"])),
+                reverse=True,
+            )[0]
+            keep_id = int(keep_row["idMovie"])
+
+            # Fill any missing values on the kept row from less complete duplicates.
+            merged = dict(keep_row)
+            for row in dup_rows:
+                if int(row["idMovie"]) == keep_id:
+                    continue
+                for key in ("c00", "c01", "c02", "c03", "c06", "c07", "c10", "c11", "c12", "c13", "c14", "c15", "c22", "premiered"):
+                    if not _is_nonempty(merged.get(key)) and _is_nonempty(row.get(key)):
+                        merged[key] = row.get(key)
+
+            _update_movie_row(conn, keep_id, merged)
+            _ensure_movie_default_video_version(conn, keep_id, int(merged["idFile"]))
+            _upsert_movie_art(conn, keep_id, merged.get("c12") or "")
+
+            for row in dup_rows:
+                drop_id = int(row["idMovie"])
+                if drop_id == keep_id:
+                    continue
+
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM art WHERE media_type = 'movie' AND media_id = %s",
+                        (drop_id,),
+                    )
+                    cur.execute(
+                        "DELETE FROM videoversion WHERE media_type = 'movie' AND idMedia = %s",
+                        (drop_id,),
+                    )
+                    cur.execute("DELETE FROM movie WHERE idMovie = %s", (drop_id,))
+                removed += 1
+
+        return removed
+
+
+def _movie_default_video_version_exists(conn, idMovie: int, idFile: int) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT idFile
+            FROM videoversion
+            WHERE idMedia = %s AND media_type = 'movie' AND itemType = 0 AND idFile = %s
+            """,
+            (idMovie, idFile),
+        )
+        return cur.fetchone() is not None
+
+
+def _ensure_movie_default_video_version(conn, idMovie: int, idFile: int) -> None:
+    if _movie_default_video_version_exists(conn, idMovie, idFile):
+        return
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO videoversion (idFile, idMedia, media_type, itemType, idType)
+            VALUES (%s, %s, 'movie', 0, 40400)
+            """,
+            (idFile, idMovie),
+        )
+
+
+
+def _upsert_movie_art(conn, idMovie: int, poster_url: str) -> None:
+    """Store Kodi poster artwork for a movie, updating in place when present."""
+    if not poster_url:
+        return
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT art_id, url FROM art WHERE media_id = %s AND media_type = 'movie' AND type = 'poster'",
+            (idMovie,),
+        )
+        row = cur.fetchone()
+        if row:
+            if row.get("url") != poster_url:
+                cur.execute(
+                    "UPDATE art SET url = %s WHERE art_id = %s",
+                    (poster_url, int(row["art_id"])),
+                )
+            return
+
+        cur.execute(
+            "INSERT INTO art (media_id, media_type, type, url) VALUES (%s, 'movie', 'poster', %s)",
+            (idMovie, poster_url),
+        )
+
+
 def _episode_exists(conn, idFile: int) -> bool:
     with conn.cursor() as cur:
         cur.execute("SELECT idEpisode FROM episode WHERE idFile = %s", (idFile,))
@@ -244,25 +568,56 @@ def upsert_movie(
         c22 = full SMB path  premiered = premiered / year
     """
     with transaction(conn):
+        preserve_existing = _movie_is_fallback_like(nfo)
+
+        # If we can already identify the movie logically, do not create a second row.
+        existing_id = _find_existing_movie_id(conn, nfo)
+        if existing_id is not None:
+            existing_row = _movie_row_for_update(conn, existing_id)
+            if existing_row:
+                merged = _merged_movie_values(existing_row, nfo, full_smb_path, preserve_existing)
+                _update_movie_row(conn, existing_id, merged)
+                _upsert_movie_art(conn, existing_id, merged.get("c12") or "")
+                _ensure_movie_default_video_version(conn, existing_id, int(existing_row["idFile"]))
+            return None
+
         idPath = _get_or_create_path(conn, directory_uri)
         idFile = _get_or_create_file(conn, idPath, filename)
         if _movie_exists(conn, idFile):
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT idMovie, idFile,
+                           c00, c01, c02, c03, c06, c07, c10, c11, c12, c13, c14, c15, c22,
+                           premiered
+                    FROM movie
+                    WHERE idFile = %s
+                    """,
+                    (idFile,),
+                )
+                row = cur.fetchone()
+            if row:
+                idMovie = int(row["idMovie"])
+                merged = _merged_movie_values(row, nfo, full_smb_path, preserve_existing)
+                _update_movie_row(conn, idMovie, merged)
+                _upsert_movie_art(conn, idMovie, merged.get("c12") or "")
+                _ensure_movie_default_video_version(conn, idMovie, idFile)
             return None
 
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO movie
-                    (idFile, idPath,
+                    (idFile,
                      c00, c01, c02, c03, c06, c07, c10, c11, c12, c13, c14, c15, c22,
                      userrating, premiered)
                 VALUES
-                    (%s, %s,
+                    (%s,
                      %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                      0, %s)
                 """,
                 (
-                    idFile, idPath,
+                    idFile,
                     nfo.title,                          # c00
                     nfo.outline,                        # c01
                     nfo.plot,                           # c02
@@ -280,6 +635,9 @@ def upsert_movie(
                 ),
             )
             idMovie = int(cur.lastrowid)
+
+        _ensure_movie_default_video_version(conn, idMovie, idFile)
+        _upsert_movie_art(conn, idMovie, nfo.thumb)
 
         logger.debug("Inserted movie idMovie=%d title=%r", idMovie, nfo.title)
         return idMovie
