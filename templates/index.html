@@ -85,6 +85,71 @@
       padding-bottom: 0.4rem;
     }
 
+    .queue-card {
+      border: 1px solid #2a3040;
+      background: #111520;
+      border-radius: 8px;
+      padding: 0.9rem;
+      margin-bottom: 1rem;
+    }
+
+    .queue-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(140px, 1fr));
+      gap: 0.7rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .queue-kv {
+      background: #141924;
+      border: 1px solid #1e2838;
+      border-radius: 6px;
+      padding: 0.55rem 0.65rem;
+    }
+
+    .queue-kv .label {
+      color: #8090a8;
+      font-size: 0.78rem;
+      display: block;
+      margin-bottom: 0.2rem;
+    }
+
+    .queue-kv .value {
+      color: #d2deec;
+      font-size: 0.92rem;
+      font-weight: 600;
+      word-break: break-word;
+    }
+
+    .queue-pending-title {
+      color: #9cb0c6;
+      font-size: 0.82rem;
+      margin-bottom: 0.4rem;
+    }
+
+    .queue-pending-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+
+    .queue-pending-item {
+      font-size: 0.8rem;
+      color: #b3c1d1;
+      background: #141924;
+      border: 1px solid #1e2838;
+      border-radius: 6px;
+      padding: 0.45rem 0.6rem;
+      word-break: break-word;
+    }
+
+    @media (max-width: 720px) {
+      .queue-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
     /* ── History table ─────────────────────────────────────────────── */
     .table-wrap {
       overflow-x: auto;
@@ -169,6 +234,27 @@
 
   <h2>Scan History</h2>
 
+  <section class="queue-card" aria-live="polite">
+    <div class="queue-grid">
+      <div class="queue-kv">
+        <span class="label">Running</span>
+        <span class="value" id="queueRunning">unknown</span>
+      </div>
+      <div class="queue-kv">
+        <span class="label">Queue Depth</span>
+        <span class="value" id="queueDepth">0</span>
+      </div>
+      <div class="queue-kv">
+        <span class="label">Active Key</span>
+        <span class="value" id="queueActiveKey">—</span>
+      </div>
+    </div>
+    <div class="queue-pending-title">Pending Requests</div>
+    <ul class="queue-pending-list" id="queuePendingList">
+      <li class="queue-pending-item">Loading queue status…</li>
+    </ul>
+  </section>
+
   {% if history %}
   <div class="table-wrap">
     <table>
@@ -236,6 +322,59 @@
 
 <script>
   let historyPollTimer = null;
+  let queuePollTimer = null;
+
+  function renderQueueState(queue) {
+    const runningEl = document.getElementById("queueRunning");
+    const depthEl = document.getElementById("queueDepth");
+    const keyEl = document.getElementById("queueActiveKey");
+    const pendingListEl = document.getElementById("queuePendingList");
+
+    const running = Boolean(queue && queue.running);
+    runningEl.textContent = running ? "yes" : "no";
+    depthEl.textContent = String((queue && queue.queue_depth) || 0);
+
+    const activeKey = (queue && queue.active_key) || "";
+    keyEl.textContent = activeKey || "—";
+
+    pendingListEl.innerHTML = "";
+    const pending = (queue && Array.isArray(queue.pending)) ? queue.pending : [];
+    if (!pending.length) {
+      const empty = document.createElement("li");
+      empty.className = "queue-pending-item";
+      empty.textContent = "No queued scans.";
+      pendingListEl.appendChild(empty);
+      return;
+    }
+
+    pending.forEach((entry, index) => {
+      const item = document.createElement("li");
+      item.className = "queue-pending-item";
+      const typeLabel = entry.is_full_scan ? "full" : "targeted";
+      const targetLabel = entry.target_path || "(full library)";
+      const source = entry.trigger_source || "unknown";
+      item.textContent = `${index + 1}. [${typeLabel}] ${source} -> ${targetLabel}`;
+      pendingListEl.appendChild(item);
+    });
+  }
+
+  async function refreshQueueStatus() {
+    try {
+      const resp = await fetch("/api/queue", { cache: "no-store" });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const data = await resp.json();
+      renderQueueState(data.queue || {});
+    } catch (err) {
+      const pendingListEl = document.getElementById("queuePendingList");
+      pendingListEl.innerHTML = "";
+      const item = document.createElement("li");
+      item.className = "queue-pending-item";
+      item.textContent = "Queue status unavailable.";
+      pendingListEl.appendChild(item);
+    }
+  }
 
   function hasRunningScanInTable() {
     const badges = document.querySelectorAll(".badge");
@@ -261,6 +400,20 @@
         window.location.reload();
       }
     }, intervalMs);
+  }
+
+  function startQueueAutoRefresh() {
+    if (queuePollTimer) {
+      clearInterval(queuePollTimer);
+      queuePollTimer = null;
+    }
+
+    refreshQueueStatus();
+    queuePollTimer = setInterval(() => {
+      if (!document.hidden) {
+        refreshQueueStatus();
+      }
+    }, 5000);
   }
 
   async function triggerScan() {
@@ -348,6 +501,7 @@
   }
 
   startHistoryAutoRefresh();
+  startQueueAutoRefresh();
 </script>
 </body>
 </html>

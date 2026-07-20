@@ -18,11 +18,13 @@ Environment variables (see .env.example)
     HISTORY_DB  (default: "/data/scan_history.db")
 """
 
-import asyncio
+from collections import deque
+from dataclasses import dataclass
 import logging
 import os
 import posixpath
 import sqlite3
+import threading
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -97,6 +99,42 @@ DB_NAME = os.environ.get("DB_NAME", "MyVideos131")
 SCAN_CRON = os.environ.get("SCAN_CRON", "0 4 * * *")
 HISTORY_DB = os.environ.get("HISTORY_DB", "/data/scan_history.db")
 HISTORY_RETENTION_DAYS = int(os.environ.get("HISTORY_RETENTION_DAYS", "7"))
+
+
+FULL_SCAN_KEY = "__full_scan__"
+
+
+@dataclass(frozen=True)
+class ScanRequest:
+    key: str
+    target_path: str | None
+    trigger_source: str
+
+
+_scan_state_lock = threading.Lock()
+_scan_queue: deque[ScanRequest] = deque()
+_queued_scan_keys: set[str] = set()
+_active_scan_key: str | None = None
+_scan_worker_thread: threading.Thread | None = None
+
+
+def _queue_state_snapshot() -> dict:
+    with _scan_state_lock:
+        running = _active_scan_key is not None
+        pending = [
+            {
+                "target_path": req.target_path or "",
+                "trigger_source": req.trigger_source,
+                "is_full_scan": req.key == FULL_SCAN_KEY,
+            }
+            for req in _scan_queue
+        ]
+        return {
+            "running": running,
+            "active_key": _active_scan_key or "",
+            "queue_depth": len(_scan_queue),
+            "pending": pending,
+        }
 
 
 def _normalize_target_path(target_path: str) -> str:
@@ -640,11 +678,94 @@ def _normalize_trigger_source(request: Request) -> str:
     return "api_scan"
 
 
-def _queue_scan(background_tasks: BackgroundTasks, target_path: str | None, trigger_source: str) -> dict:
-    background_tasks.add_task(run_scan, target_path, trigger_source)
-    payload = {"status": "scan triggered", "trigger_source": trigger_source}
+def _scan_key_for_target(target_path: str | None) -> str:
+    if not target_path:
+        return FULL_SCAN_KEY
+    normalized = _normalize_target_path(target_path).lower().rstrip("/")
+    return normalized or FULL_SCAN_KEY
+
+
+def _scan_worker_loop() -> None:
+    global _active_scan_key
+    global _scan_worker_thread
+
+    while True:
+        with _scan_state_lock:
+            if not _scan_queue:
+                _scan_worker_thread = None
+                return
+            request = _scan_queue.popleft()
+            _queued_scan_keys.discard(request.key)
+            _active_scan_key = request.key
+            remaining = len(_scan_queue)
+
+        logger.info(
+            "Starting queued scan: source=%s target=%r queue_remaining=%d",
+            request.trigger_source,
+            request.target_path,
+            remaining,
+        )
+        try:
+            run_scan(request.target_path, request.trigger_source)
+        finally:
+            with _scan_state_lock:
+                _active_scan_key = None
+
+
+def _enqueue_scan(target_path: str | None, trigger_source: str) -> dict:
+    global _scan_worker_thread
+
+    key = _scan_key_for_target(target_path)
+    worker_should_start = False
+
+    with _scan_state_lock:
+        is_running = _active_scan_key is not None
+        if key in _queued_scan_keys:
+            payload = {
+                "status": "scan already queued",
+                "trigger_source": trigger_source,
+                "consolidated": True,
+                "currently_running": is_running,
+                "queue_depth": len(_scan_queue),
+            }
+        else:
+            _scan_queue.append(
+                ScanRequest(
+                    key=key,
+                    target_path=target_path,
+                    trigger_source=trigger_source,
+                )
+            )
+            _queued_scan_keys.add(key)
+            payload = {
+                "status": "scan queued",
+                "trigger_source": trigger_source,
+                "consolidated": False,
+                "currently_running": is_running,
+                "queue_depth": len(_scan_queue),
+            }
+            if _scan_worker_thread is None or not _scan_worker_thread.is_alive():
+                _scan_worker_thread = threading.Thread(
+                    target=_scan_worker_loop,
+                    name="scan-worker",
+                    daemon=True,
+                )
+                worker_should_start = True
+
     if target_path:
         payload["target_path"] = target_path
+
+    if worker_should_start:
+        _scan_worker_thread.start()
+
+    logger.info(
+        "Enqueued scan request: source=%s target=%r status=%s queue_depth=%s",
+        trigger_source,
+        target_path,
+        payload.get("status"),
+        payload.get("queue_depth"),
+    )
+
     return payload
 
 
@@ -802,9 +923,8 @@ def _schedule_scan() -> None:
 
 
 async def _async_scan() -> None:
-    """Async wrapper: run the blocking scan in a thread-pool executor."""
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, run_scan, None, "scheduled")
+    """Scheduler callback: enqueue a scan without running in parallel."""
+    _enqueue_scan(None, "scheduled")
 
 
 def run_movie_dedupe_maintenance() -> int:
@@ -945,8 +1065,8 @@ async def dashboard(request: Request):
 
 @app.post("/scan")
 @app.get("/scan")
-async def trigger_scan(request: Request, background_tasks: BackgroundTasks):
-    """Kick off an immediate scan as a FastAPI background task."""
+async def trigger_scan(request: Request):
+    """Queue a scan request; scans run one-at-a-time in FIFO order."""
     target_path = await _extract_target_path(request)
     trigger_source = _normalize_trigger_source(request)
     if trigger_source == "dashboard":
@@ -961,7 +1081,7 @@ async def trigger_scan(request: Request, background_tasks: BackgroundTasks):
         target_path,
     )
 
-    payload = _queue_scan(background_tasks, target_path, trigger_source)
+    payload = _enqueue_scan(target_path, trigger_source)
     return JSONResponse(payload, status_code=202)
 
 
@@ -987,7 +1107,7 @@ async def trigger_missing_artwork_backfill(background_tasks: BackgroundTasks):
 
 
 @app.post("/jsonrpc")
-async def kodi_jsonrpc(request: Request, background_tasks: BackgroundTasks):
+async def kodi_jsonrpc(request: Request):
     """Kodi-compatible JSON-RPC surface for VideoLibrary.Scan."""
     payload = await request.json()
     method = payload.get("method")
@@ -1007,13 +1127,18 @@ async def kodi_jsonrpc(request: Request, background_tasks: BackgroundTasks):
         client_host,
         target_path,
     )
-    background_tasks.add_task(run_scan, target_path, "jsonrpc")
+    _enqueue_scan(target_path, "jsonrpc")
     return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": "OK"}, status_code=200)
 
 
 @app.get("/api/history")
 async def api_history():
     return {"history": get_history()}
+
+
+@app.get("/api/queue")
+async def api_queue():
+    return {"queue": _queue_state_snapshot()}
 
 
 # ---------------------------------------------------------------------------
