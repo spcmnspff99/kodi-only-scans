@@ -569,19 +569,58 @@ async def _extract_target_path(request: Request) -> Optional[str]:
     if not isinstance(payload, dict):
         return None
 
-    for key in ("path", "directory", "file", "target"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
+    # Radarr/Sonarr payloads often nest the useful path under movie/movieFile/series.
+    candidate_keys = (
+        "path",
+        "directory",
+        "file",
+        "target",
+        "folderPath",
+        "folder",
+        "relativePath",
+    )
 
-    params = payload.get("params")
-    if isinstance(params, dict):
-        for key in ("path", "directory", "file", "target"):
-            value = params.get(key)
-            if isinstance(value, str) and value.strip():
-                return value
+    def _find_path(value) -> Optional[str]:
+        if isinstance(value, dict):
+            for key in candidate_keys:
+                maybe = value.get(key)
+                if isinstance(maybe, str) and maybe.strip():
+                    return maybe
+            for nested in value.values():
+                found = _find_path(nested)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for nested in value:
+                found = _find_path(nested)
+                if found:
+                    return found
+        return None
 
-    return None
+    return _find_path(payload)
+
+
+def _normalize_trigger_source(request: Request) -> str:
+    source = (request.query_params.get("source") or "").strip().lower()
+    if source:
+        return source
+
+    user_agent = (request.headers.get("user-agent") or "").lower()
+    if "radarr" in user_agent:
+        return "radarr"
+    if "sonarr" in user_agent:
+        return "sonarr"
+    if "kodi" in user_agent:
+        return "kodi"
+    return "api_scan"
+
+
+def _queue_scan(background_tasks: BackgroundTasks, target_path: str | None, trigger_source: str) -> dict:
+    background_tasks.add_task(run_scan, target_path, trigger_source)
+    payload = {"status": "scan triggered", "trigger_source": trigger_source}
+    if target_path:
+        payload["target_path"] = target_path
+    return payload
 
 
 def _scan_movies_tree(db_conn, movies_share: str, movies_path: str, errors: list) -> int:
@@ -880,18 +919,24 @@ async def dashboard(request: Request):
 
 
 @app.post("/scan")
+@app.get("/scan")
 async def trigger_scan(request: Request, background_tasks: BackgroundTasks):
     """Kick off an immediate scan as a FastAPI background task."""
     target_path = await _extract_target_path(request)
-    source = (request.query_params.get("source") or "").strip().lower()
-    if source == "dashboard":
+    trigger_source = _normalize_trigger_source(request)
+    if trigger_source == "dashboard":
         trigger_source = "dashboard"
-    else:
-        trigger_source = "api_scan"
-    background_tasks.add_task(run_scan, target_path, trigger_source)
-    payload = {"status": "scan triggered"}
-    if target_path:
-        payload["target_path"] = target_path
+
+    client_host = request.client.host if request.client else "unknown"
+    logger.info(
+        "Incoming /scan trigger: method=%s source=%s client=%s target=%r",
+        request.method,
+        trigger_source,
+        client_host,
+        target_path,
+    )
+
+    payload = _queue_scan(background_tasks, target_path, trigger_source)
     return JSONResponse(payload, status_code=202)
 
 
@@ -931,6 +976,12 @@ async def kodi_jsonrpc(request: Request, background_tasks: BackgroundTasks):
 
     params = payload.get("params") or {}
     target_path = params.get("directory") or params.get("path") or params.get("file") or params.get("target")
+    client_host = request.client.host if request.client else "unknown"
+    logger.info(
+        "Incoming /jsonrpc VideoLibrary.Scan: client=%s target=%r",
+        client_host,
+        target_path,
+    )
     background_tasks.add_task(run_scan, target_path, "jsonrpc")
     return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": "OK"}, status_code=200)
 
