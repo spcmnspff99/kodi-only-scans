@@ -37,13 +37,25 @@ from fastapi.templating import Jinja2Templates
 
 import smbclient
 
-from db_ops import dedupe_movies, get_connection, get_or_create_tvshow, rebuild_movie_sort_titles, upsert_episode, upsert_movie
+from db_ops import (
+    backfill_movie_art_if_missing,
+    backfill_tvshow_art_if_missing,
+    dedupe_movies,
+    get_connection,
+    get_movies_missing_artwork,
+    get_or_create_tvshow,
+    get_tvshows_missing_artwork,
+    rebuild_movie_sort_titles,
+    upsert_episode,
+    upsert_movie,
+)
 from nfo_parser import MovieNfo, guess_movie_from_filename, parse_episode_nfo, parse_movie_nfo, parse_tvshow_nfo
 from smb_walker import (
     VideoFile,
     build_smb_dir_uri,
     build_smb_file_uri,
     build_unc,
+    list_smb_files,
     list_smb_subdirs,
     read_smb_file,
     resolve_share_path,
@@ -162,6 +174,29 @@ def _resolve_scan_target(target_path: str) -> Optional[dict]:
         }
 
     return None
+
+
+def _parse_smb_dir_uri(uri: str) -> Optional[tuple[str, str]]:
+    """Parse smb://host/share/path/ into (share, relative_path)."""
+    normalized = _normalize_target_path(uri)
+    if not normalized.lower().startswith("smb://"):
+        return None
+    parts = [part for part in normalized.split("/") if part]
+    # parts: ["smb:", "host", "share", "path", ...]
+    if len(parts) < 3:
+        return None
+    share = parts[2]
+    rel = "/".join(parts[3:]).strip("/\\")
+    return share, rel
+
+
+def _pick_art_filename(file_names: list[str], preferred_names: tuple[str, ...]) -> str:
+    lower_map = {name.lower(): name for name in file_names}
+    for preferred in preferred_names:
+        matched = lower_map.get(preferred)
+        if matched:
+            return matched
+    return ""
 
 # ---------------------------------------------------------------------------
 # Scan history (SQLite)
@@ -435,7 +470,21 @@ def run_scan(target_path: str | None = None) -> None:
                     scan_rel = resolve_share_path(
                         SMB_HOST, target["share"], target["scan_rel"], library_type="movies"
                     )
-                    movies_added += _scan_movies_tree(db_conn, target["share"], scan_rel, errors)
+                    target_unc = build_unc(SMB_HOST, target["share"], scan_rel)
+                    if smb_dir_exists(target_unc):
+                        movies_added += _scan_movies_tree(db_conn, target["share"], scan_rel, errors)
+                    else:
+                        logger.warning(
+                            "Target movie path not found: %s. Falling back to full movies root scan.",
+                            scan_rel,
+                        )
+                        root_movies_path = resolve_share_path(
+                            SMB_HOST,
+                            target["share"],
+                            SMB_MOVIES_PATH,
+                            library_type="movies",
+                        )
+                        movies_added += _scan_movies_tree(db_conn, target["share"], root_movies_path, errors)
                 else:
                     scan_rel = resolve_share_path(
                         SMB_HOST, target["share"], target["scan_rel"], library_type="tv"
@@ -547,6 +596,13 @@ def _process_movie(db_conn, vf: VideoFile):
         share_name = parts[3] if len(parts) > 3 else SMB_MOVIES_SHARE
         directory_name = parts[-1]
         nfo.thumb = build_smb_file_uri(SMB_HOST, share_name, f"{directory_name}/poster.jpg")
+
+    if vf.fanart_unc:
+        parts = vf.directory_uri.rstrip("/").split("/")
+        share_name = parts[3] if len(parts) > 3 else SMB_MOVIES_SHARE
+        directory_name = parts[-1]
+        fanart_name = vf.fanart_unc.replace("\\", "/").rsplit("/", 1)[-1]
+        nfo.fanart = build_smb_file_uri(SMB_HOST, share_name, f"{directory_name}/{fanart_name}")
 
     result = upsert_movie(db_conn, vf.directory_uri, vf.filename, vf.smb_uri, nfo)
     if result is not None:
@@ -684,6 +740,98 @@ def run_movie_sort_title_rebuild_maintenance() -> dict:
         db_conn.close()
 
 
+def run_missing_artwork_backfill_maintenance() -> dict:
+    """Backfill missing poster/fanart for movies and tvshows from local sidecars/NFO."""
+    if not DB_HOST:
+        raise RuntimeError("DB_HOST not configured")
+
+    db_conn = get_connection(DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME)
+    summary = {
+        "movies_examined": 0,
+        "movies_updated": 0,
+        "tvshows_examined": 0,
+        "tvshows_updated": 0,
+        "skipped": 0,
+    }
+    try:
+        movie_rows = get_movies_missing_artwork(db_conn)
+        for row in movie_rows:
+            summary["movies_examined"] += 1
+            parsed = _parse_smb_dir_uri(row.get("strPath") or "")
+            if not parsed:
+                summary["skipped"] += 1
+                continue
+
+            share, rel = parsed
+            scan_rel = resolve_share_path(SMB_HOST, share, rel, library_type="movies")
+            if not smb_dir_exists(build_unc(SMB_HOST, share, scan_rel)):
+                summary["skipped"] += 1
+                continue
+
+            for vf in walk_videos(SMB_HOST, share, scan_rel):
+                if vf.directory_uri.rstrip("/") != build_smb_dir_uri(SMB_HOST, share, scan_rel).rstrip("/"):
+                    continue
+                poster_url = ""
+                fanart_url = ""
+                if vf.poster_unc:
+                    art_name = vf.poster_unc.replace("\\", "/").rsplit("/", 1)[-1]
+                    poster_url = build_smb_file_uri(SMB_HOST, share, f"{scan_rel}/{art_name}".strip("/"))
+                if vf.fanart_unc:
+                    art_name = vf.fanart_unc.replace("\\", "/").rsplit("/", 1)[-1]
+                    fanart_url = build_smb_file_uri(SMB_HOST, share, f"{scan_rel}/{art_name}".strip("/"))
+                if backfill_movie_art_if_missing(db_conn, vf.directory_uri, vf.filename, poster_url, fanart_url):
+                    summary["movies_updated"] += 1
+                break
+
+        tv_rows = get_tvshows_missing_artwork(db_conn)
+        for row in tv_rows:
+            summary["tvshows_examined"] += 1
+            parsed = _parse_smb_dir_uri(row.get("strPath") or "")
+            if not parsed:
+                summary["skipped"] += 1
+                continue
+
+            share, rel = parsed
+            scan_rel = resolve_share_path(SMB_HOST, share, rel, library_type="tv")
+            show_uri = build_smb_dir_uri(SMB_HOST, share, scan_rel)
+            show_unc = build_unc(SMB_HOST, share, scan_rel)
+            if not smb_dir_exists(show_unc):
+                summary["skipped"] += 1
+                continue
+
+            file_names = list_smb_files(show_unc)
+            poster_name = _pick_art_filename(file_names, ("poster.jpg", "poster.jpeg", "folder.jpg", "folder.jpeg"))
+            fanart_name = _pick_art_filename(file_names, ("fanart.jpg", "fanart.jpeg", "backdrop.jpg", "backdrop.jpeg"))
+            poster_url = build_smb_file_uri(SMB_HOST, share, f"{scan_rel}/{poster_name}".strip("/")) if poster_name else ""
+            fanart_url = build_smb_file_uri(SMB_HOST, share, f"{scan_rel}/{fanart_name}".strip("/")) if fanart_name else ""
+
+            if not poster_url or not fanart_url:
+                tvshow_nfo_unc = build_unc(SMB_HOST, share, f"{scan_rel}/tvshow.nfo")
+                content = read_smb_file(tvshow_nfo_unc)
+                if content:
+                    show_nfo = parse_tvshow_nfo(content)
+                    if show_nfo:
+                        if not poster_url:
+                            poster_url = show_nfo.thumb
+                        if not fanart_url:
+                            fanart_url = show_nfo.fanart
+
+            if backfill_tvshow_art_if_missing(db_conn, show_uri, poster_url, fanart_url):
+                summary["tvshows_updated"] += 1
+
+        logger.info(
+            "Missing artwork backfill complete: movies %d/%d, tvshows %d/%d, skipped=%d",
+            summary["movies_updated"],
+            summary["movies_examined"],
+            summary["tvshows_updated"],
+            summary["tvshows_examined"],
+            summary["skipped"],
+        )
+        return summary
+    finally:
+        db_conn.close()
+
+
 app = FastAPI(title="Kodi Only Scans", lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
 
@@ -719,6 +867,13 @@ async def trigger_movie_sort_title_rebuild(background_tasks: BackgroundTasks):
     """Dashboard-only trigger for movie sort-title rebuild maintenance."""
     background_tasks.add_task(run_movie_sort_title_rebuild_maintenance)
     return JSONResponse({"status": "movie sort-title rebuild triggered"}, status_code=202)
+
+
+@app.post("/dashboard/maintenance/backfill-missing-artwork")
+async def trigger_missing_artwork_backfill(background_tasks: BackgroundTasks):
+    """Dashboard-only trigger for missing poster/fanart backfill."""
+    background_tasks.add_task(run_missing_artwork_backfill_maintenance)
+    return JSONResponse({"status": "missing artwork backfill triggered"}, status_code=202)
 
 
 @app.post("/jsonrpc")

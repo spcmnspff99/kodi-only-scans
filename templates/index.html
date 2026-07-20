@@ -64,6 +64,8 @@
     #dedupeBtn:hover { background: #267447; }
     #sortTitleBtn { background: #8b6f2e; }
     #sortTitleBtn:hover { background: #745c26; }
+    #backfillArtBtn { background: #2e5f8b; }
+    #backfillArtBtn:hover { background: #264f74; }
 
     /* ── Status banner ─────────────────────────────────────────────── */
     #statusMsg {
@@ -159,6 +161,7 @@
         <button id="scanBtn" class="action-btn" onclick="triggerScan()">▶ Scan Now</button>
         <button id="dedupeBtn" class="action-btn" onclick="triggerMovieDedupe()">🧹 Deduplicate Movies</button>
         <button id="sortTitleBtn" class="action-btn" onclick="rebuildMovieSortTitles()">🔤 Rebuild Movie Sort Titles</button>
+        <button id="backfillArtBtn" class="action-btn" onclick="backfillMissingArtwork()">🖼 Backfill Missing Artwork</button>
       </div>
       <div id="statusMsg"></div>
     </div>
@@ -222,6 +225,34 @@
 </div>
 
 <script>
+  let historyPollTimer = null;
+
+  function hasRunningScanInTable() {
+    const badges = document.querySelectorAll(".badge");
+    for (const badge of badges) {
+      if ((badge.textContent || "").trim().toLowerCase() === "running") {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function startHistoryAutoRefresh() {
+    if (historyPollTimer) {
+      clearInterval(historyPollTimer);
+      historyPollTimer = null;
+    }
+
+    // Refresh faster while a scan is running, slower otherwise.
+    const intervalMs = hasRunningScanInTable() ? 5000 : 30000;
+    historyPollTimer = setInterval(() => {
+      // Avoid surprising reloads while user has switched away.
+      if (!document.hidden) {
+        window.location.reload();
+      }
+    }, intervalMs);
+  }
+
   async function triggerScan() {
     const msg = document.getElementById("statusMsg");
     setActionButtonsDisabled(true);
@@ -243,7 +274,7 @@
   }
 
   function setActionButtonsDisabled(disabled) {
-    for (const id of ["scanBtn", "dedupeBtn", "sortTitleBtn"]) {
+    for (const id of ["scanBtn", "dedupeBtn", "sortTitleBtn", "backfillArtBtn"]) {
       const btn = document.getElementById(id);
       if (btn) btn.disabled = disabled;
     }
@@ -286,6 +317,27 @@
       }, 3000);
     }
   }
+
+  async function backfillMissingArtwork() {
+    const msg = document.getElementById("statusMsg");
+    setActionButtonsDisabled(true);
+    msg.textContent = "🖼 Missing artwork backfill triggered – running in background…";
+
+    try {
+      const resp = await fetch("/dashboard/maintenance/backfill-missing-artwork", { method: "POST" });
+      const data = await resp.json();
+      msg.textContent = "✅ " + (data.status ?? "Missing artwork backfill started");
+    } catch (err) {
+      msg.textContent = "❌ Failed to trigger missing artwork backfill: " + err;
+    } finally {
+      setTimeout(() => {
+        setActionButtonsDisabled(false);
+        window.location.reload();
+      }, 3000);
+    }
+  }
+
+  startHistoryAutoRefresh();
 </script>
 </body>
 </html>

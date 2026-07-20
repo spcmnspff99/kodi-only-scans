@@ -45,6 +45,7 @@ class VideoFile:
     unc_dir: str            # \\server\share\path\to  (smbclient directory operations)
     nfo_unc: Optional[str]  # \\server\share\path\to\file.nfo, or None if absent
     poster_unc: Optional[str]  # \\server\share\path\to\poster.jpg, or None if absent
+    fanart_unc: Optional[str]  # \\server\share\path\to\fanart.jpg, or None if absent
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +106,18 @@ def list_smb_subdirs(unc_path: str) -> List[str]:
         return []
 
 
+def list_smb_files(unc_path: str) -> List[str]:
+    """Return the names of immediate files under *unc_path*.
+
+    Returns an empty list on any error.
+    """
+    try:
+        return [e.name for e in smbclient.scandir(unc_path) if not e.is_dir(follow_symlinks=False)]
+    except Exception as exc:
+        logger.warning("Cannot list files of %s: %s", unc_path, exc)
+        return []
+
+
 def smb_dir_exists(unc_path: str) -> bool:
     """Return ``True`` if *unc_path* can be listed as a directory."""
     try:
@@ -141,12 +154,18 @@ def resolve_share_path(
     # Try segment-by-segment matching in case only case/spaces/underscores differ.
     resolved_segments: List[str] = []
     configured_segments = [p for p in rel.replace("\\", "/").split("/") if p]
+    failed_segment: Optional[str] = None
+    failed_parent_segments: List[str] = []
+    failed_at_index = -1
     for segment in configured_segments:
         parent_rel = "/".join(resolved_segments)
         parent_unc = build_unc(server, share, parent_rel)
         candidates = list_smb_subdirs(parent_unc)
         match = _pick_matching_segment(segment, candidates)
         if not match:
+            failed_segment = segment
+            failed_parent_segments = list(resolved_segments)
+            failed_at_index = len(resolved_segments)
             resolved_segments = []
             break
         resolved_segments.append(match)
@@ -156,6 +175,24 @@ def resolve_share_path(
         if smb_dir_exists(build_unc(server, share, resolved_rel)):
             logger.info("Resolved SMB path %r -> %r", configured_path, resolved_rel)
             return resolved_rel
+
+    # Movie-target fallback: if only the final segment fails, attempt a
+    # title/year-aware match (e.g. "The Breadwinner (2017)" -> "Breadwinner (2017)").
+    if (
+        library_type.lower() == "movies"
+        and failed_segment
+        and configured_segments
+        and failed_at_index == len(configured_segments) - 1
+    ):
+        parent_rel = "/".join(failed_parent_segments)
+        parent_unc = build_unc(server, share, parent_rel)
+        candidates = list_smb_subdirs(parent_unc)
+        fallback = _pick_matching_movie_leaf(failed_segment, candidates)
+        if fallback:
+            resolved_rel = "/".join(failed_parent_segments + [fallback])
+            if smb_dir_exists(build_unc(server, share, resolved_rel)):
+                logger.info("Resolved SMB movie leaf %r -> %r", configured_path, resolved_rel)
+                return resolved_rel
 
     # Alias fallback is intentionally conservative and only used for single-segment
     # configured paths to avoid accidentally remapping deep custom structures.
@@ -180,6 +217,60 @@ def _pick_matching_segment(segment: str, candidates: List[str]) -> Optional[str]
     if len(normalized_matches) == 1:
         return normalized_matches[0]
     return None
+
+
+def _pick_matching_movie_leaf(segment: str, candidates: List[str]) -> Optional[str]:
+    """Best-effort movie folder matcher for final path segment mismatches."""
+    seg_title, seg_year = _normalize_movie_folder_key(segment)
+    if not seg_title:
+        return None
+
+    scored: List[tuple[int, str]] = []
+    for candidate in candidates:
+        cand_title, cand_year = _normalize_movie_folder_key(candidate)
+        if not cand_title:
+            continue
+
+        score = 0
+        if cand_title == seg_title:
+            score += 4
+        elif cand_title in seg_title or seg_title in cand_title:
+            score += 2
+        else:
+            continue
+
+        if seg_year and cand_year:
+            if seg_year == cand_year:
+                score += 3
+            else:
+                # Strong title match but conflicting year is likely wrong.
+                continue
+        elif seg_year or cand_year:
+            score += 1
+
+        scored.append((score, candidate))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score = scored[0][0]
+    best_names = sorted([name for score, name in scored if score == best_score])
+    if len(best_names) == 1:
+        return best_names[0]
+    return None
+
+
+def _normalize_movie_folder_key(name: str) -> tuple[str, str]:
+    text = name.strip().lower()
+    year_match = re.search(r"\b(19|20)\d{2}\b", text)
+    year = year_match.group(0) if year_match else ""
+
+    # Remove bracketed year and normalize common article placement variants.
+    title = re.sub(r"\((19|20)\d{2}\)", "", text)
+    title = re.sub(r",\s*(the|a|an)$", "", title)
+    title = re.sub(r"^(the|a|an)\s+", "", title)
+    return _normalize_name(title), year
 
 
 def _guess_library_root(root_dirs: List[str], library_type: str) -> Optional[str]:
@@ -258,6 +349,9 @@ def _walk(server: str, share: str, unc_dir: str) -> Iterator[VideoFile]:
         else:
             file_names.add(entry.name)
 
+    # Build a case-insensitive lookup once for predictable art sidecar matching.
+    lower_file_names = {name.lower(): name for name in file_names}
+
     # Yield video files in this directory
     for fname in file_names:
         ext = os.path.splitext(fname)[1].lower()
@@ -281,8 +375,16 @@ def _walk(server: str, share: str, unc_dir: str) -> Iterator[VideoFile]:
 
         poster_unc = None
         for art_name in ("poster.jpg", "poster.jpeg", "folder.jpg", "folder.jpeg"):
-            if art_name in file_names:
-                poster_unc = f"{unc_dir}\\{art_name}"
+            matched = lower_file_names.get(art_name)
+            if matched:
+                poster_unc = f"{unc_dir}\\{matched}"
+                break
+
+        fanart_unc = None
+        for art_name in ("fanart.jpg", "fanart.jpeg", "backdrop.jpg", "backdrop.jpeg"):
+            matched = lower_file_names.get(art_name)
+            if matched:
+                fanart_unc = f"{unc_dir}\\{matched}"
                 break
 
         dir_smb_uri = _unc_to_smb_dir_uri(server, share, unc_dir)
@@ -295,6 +397,7 @@ def _walk(server: str, share: str, unc_dir: str) -> Iterator[VideoFile]:
             unc_dir=unc_dir,
             nfo_unc=nfo_unc,
             poster_unc=poster_unc,
+            fanart_unc=fanart_unc,
         )
 
     # Recurse

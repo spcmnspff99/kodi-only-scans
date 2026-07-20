@@ -170,6 +170,7 @@ def _movie_is_fallback_like(nfo: MovieNfo) -> bool:
                 nfo.mpaa,
                 nfo.imdb_id,
                 nfo.thumb,
+                nfo.fanart,
             )
         )
         and not nfo.genre
@@ -465,29 +466,188 @@ def _ensure_movie_default_video_version(conn, idMovie: int, idFile: int) -> None
 
 
 
-def _upsert_movie_art(conn, idMovie: int, poster_url: str) -> None:
-    """Store Kodi poster artwork for a movie, updating in place when present."""
-    if not poster_url:
+def _upsert_movie_art_type(conn, idMovie: int, art_type: str, art_url: str) -> None:
+    if not art_url:
         return
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT art_id, url FROM art WHERE media_id = %s AND media_type = 'movie' AND type = 'poster'",
-            (idMovie,),
+            "SELECT art_id, url FROM art WHERE media_id = %s AND media_type = 'movie' AND type = %s",
+            (idMovie, art_type),
         )
         row = cur.fetchone()
         if row:
-            if row.get("url") != poster_url:
+            if row.get("url") != art_url:
                 cur.execute(
                     "UPDATE art SET url = %s WHERE art_id = %s",
-                    (poster_url, int(row["art_id"])),
+                    (art_url, int(row["art_id"])),
                 )
             return
 
         cur.execute(
-            "INSERT INTO art (media_id, media_type, type, url) VALUES (%s, 'movie', 'poster', %s)",
-            (idMovie, poster_url),
+            "INSERT INTO art (media_id, media_type, type, url) VALUES (%s, 'movie', %s, %s)",
+            (idMovie, art_type, art_url),
         )
+
+
+def _upsert_movie_art(conn, idMovie: int, poster_url: str = "", fanart_url: str = "") -> None:
+    """Store Kodi movie artwork rows (poster/fanart), updating in place."""
+    _upsert_movie_art_type(conn, idMovie, "poster", poster_url)
+    _upsert_movie_art_type(conn, idMovie, "fanart", fanart_url)
+
+
+def _has_art_type(conn, media_type: str, media_id: int, art_type: str) -> bool:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT art_id
+            FROM art
+            WHERE media_type = %s AND media_id = %s AND type = %s AND COALESCE(url, '') <> ''
+            LIMIT 1
+            """,
+            (media_type, media_id, art_type),
+        )
+        return cur.fetchone() is not None
+
+
+def get_movies_missing_artwork(conn) -> list[dict]:
+    """Return movie rows that are missing poster and/or fanart in the art table."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT m.idMovie, m.c00 AS title, p.strPath,
+                   MAX(CASE WHEN a.type = 'poster' AND COALESCE(a.url, '') <> '' THEN 1 ELSE 0 END) AS hasPoster,
+                   MAX(CASE WHEN a.type = 'fanart' AND COALESCE(a.url, '') <> '' THEN 1 ELSE 0 END) AS hasFanart
+            FROM movie m
+            JOIN files f ON f.idFile = m.idFile
+            JOIN path p ON p.idPath = f.idPath
+            LEFT JOIN art a
+              ON a.media_type = 'movie'
+             AND a.media_id = m.idMovie
+             AND a.type IN ('poster', 'fanart')
+            GROUP BY m.idMovie, m.c00, p.strPath
+            HAVING hasPoster = 0 OR hasFanart = 0
+            ORDER BY m.idMovie ASC
+            """
+        )
+        return cur.fetchall() or []
+
+
+def get_tvshows_missing_artwork(conn) -> list[dict]:
+    """Return tvshow rows that are missing poster and/or fanart in the art table."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT t.idShow, t.c00 AS title, p.strPath,
+                   MAX(CASE WHEN a.type = 'poster' AND COALESCE(a.url, '') <> '' THEN 1 ELSE 0 END) AS hasPoster,
+                   MAX(CASE WHEN a.type = 'fanart' AND COALESCE(a.url, '') <> '' THEN 1 ELSE 0 END) AS hasFanart
+            FROM tvshow t
+            JOIN tvshowlinkpath tlp ON tlp.idShow = t.idShow
+            JOIN path p ON p.idPath = tlp.idPath
+            LEFT JOIN art a
+              ON a.media_type = 'tvshow'
+             AND a.media_id = t.idShow
+             AND a.type IN ('poster', 'fanart')
+            GROUP BY t.idShow, t.c00, p.strPath
+            HAVING hasPoster = 0 OR hasFanart = 0
+            ORDER BY t.idShow ASC
+            """
+        )
+        return cur.fetchall() or []
+
+
+def _upsert_media_art_type(conn, media_type: str, media_id: int, art_type: str, art_url: str) -> bool:
+    if not art_url:
+        return False
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT art_id, url FROM art WHERE media_type = %s AND media_id = %s AND type = %s",
+            (media_type, media_id, art_type),
+        )
+        row = cur.fetchone()
+        if row:
+            if row.get("url") != art_url:
+                cur.execute("UPDATE art SET url = %s WHERE art_id = %s", (art_url, int(row["art_id"])))
+                return True
+            return False
+
+        cur.execute(
+            "INSERT INTO art (media_id, media_type, type, url) VALUES (%s, %s, %s, %s)",
+            (media_id, media_type, art_type, art_url),
+        )
+        return True
+
+
+def backfill_movie_art_if_missing(conn, directory_uri: str, filename: str, poster_url: str = "", fanart_url: str = "") -> bool:
+    """Backfill movie poster/fanart only when missing for an existing movie row."""
+    with transaction(conn):
+        with conn.cursor() as cur:
+            cur.execute("SELECT idPath FROM path WHERE strPath = %s", (directory_uri,))
+            path_row = cur.fetchone()
+            if not path_row:
+                return False
+            idPath = int(path_row["idPath"])
+
+            cur.execute(
+                "SELECT idFile FROM files WHERE idPath = %s AND strFilename = %s",
+                (idPath, filename),
+            )
+            file_row = cur.fetchone()
+            if not file_row:
+                return False
+            idFile = int(file_row["idFile"])
+
+            cur.execute("SELECT idMovie, c12 FROM movie WHERE idFile = %s", (idFile,))
+            movie_row = cur.fetchone()
+            if not movie_row:
+                return False
+            idMovie = int(movie_row["idMovie"])
+
+        changed = False
+        if poster_url and not _has_art_type(conn, "movie", idMovie, "poster"):
+            changed = _upsert_media_art_type(conn, "movie", idMovie, "poster", poster_url) or changed
+            if not (movie_row.get("c12") or ""):
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE movie SET c12 = %s WHERE idMovie = %s", (poster_url, idMovie))
+                changed = True
+
+        if fanart_url and not _has_art_type(conn, "movie", idMovie, "fanart"):
+            changed = _upsert_media_art_type(conn, "movie", idMovie, "fanart", fanart_url) or changed
+
+        return changed
+
+
+def backfill_tvshow_art_if_missing(conn, show_directory_uri: str, poster_url: str = "", fanart_url: str = "") -> bool:
+    """Backfill tvshow poster/fanart only when missing for an existing tvshow row."""
+    with transaction(conn):
+        with conn.cursor() as cur:
+            cur.execute("SELECT idPath FROM path WHERE strPath = %s", (show_directory_uri,))
+            path_row = cur.fetchone()
+            if not path_row:
+                return False
+            idPath = int(path_row["idPath"])
+
+            cur.execute("SELECT idShow FROM tvshowlinkpath WHERE idPath = %s LIMIT 1", (idPath,))
+            show_row = cur.fetchone()
+            if not show_row:
+                return False
+            idShow = int(show_row["idShow"])
+
+        changed = False
+        if poster_url and not _has_art_type(conn, "tvshow", idShow, "poster"):
+            changed = _upsert_media_art_type(conn, "tvshow", idShow, "poster", poster_url) or changed
+            with conn.cursor() as cur:
+                cur.execute("SELECT c05 FROM tvshow WHERE idShow = %s", (idShow,))
+                tv_row = cur.fetchone()
+                if tv_row and not (tv_row.get("c05") or ""):
+                    cur.execute("UPDATE tvshow SET c05 = %s WHERE idShow = %s", (poster_url, idShow))
+                    changed = True
+
+        if fanart_url and not _has_art_type(conn, "tvshow", idShow, "fanart"):
+            changed = _upsert_media_art_type(conn, "tvshow", idShow, "fanart", fanart_url) or changed
+
+        return changed
 
 
 def _episode_exists(conn, idFile: int) -> bool:
@@ -608,8 +768,9 @@ def upsert_movie(
             existing_row = _movie_row_for_update(conn, existing_id)
             if existing_row:
                 merged = _merged_movie_values(existing_row, nfo, full_smb_path, preserve_existing)
+                # Keep existing poster field stable for already-known movies.
+                merged["c12"] = existing_row.get("c12") or ""
                 _update_movie_row(conn, existing_id, merged)
-                _upsert_movie_art(conn, existing_id, merged.get("c12") or "")
                 _ensure_movie_default_video_version(conn, existing_id, int(existing_row["idFile"]))
             return None
 
@@ -631,8 +792,9 @@ def upsert_movie(
             if row:
                 idMovie = int(row["idMovie"])
                 merged = _merged_movie_values(row, nfo, full_smb_path, preserve_existing)
+                # Keep existing poster field stable for already-known movies.
+                merged["c12"] = row.get("c12") or ""
                 _update_movie_row(conn, idMovie, merged)
-                _upsert_movie_art(conn, idMovie, merged.get("c12") or "")
                 _ensure_movie_default_video_version(conn, idMovie, idFile)
             return None
 
@@ -669,7 +831,7 @@ def upsert_movie(
             idMovie = int(cur.lastrowid)
 
         _ensure_movie_default_video_version(conn, idMovie, idFile)
-        _upsert_movie_art(conn, idMovie, nfo.thumb)
+        _upsert_movie_art(conn, idMovie, poster_url=nfo.thumb, fanart_url=nfo.fanart)
 
         logger.debug("Inserted movie idMovie=%d title=%r", idMovie, nfo.title)
         return idMovie
