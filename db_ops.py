@@ -239,7 +239,8 @@ def _build_movie_values_from_nfo(nfo: MovieNfo, full_smb_path: str) -> dict:
         "c03": nfo.tagline,
         "c06": " / ".join(nfo.writer),
         "c07": nfo.year,
-        "c10": " / ".join(nfo.director),
+        # Kodi orders movie titles by sort title (c10) when present.
+        "c10": nfo.sorttitle or nfo.title,
         "c11": nfo.originaltitle,
         "c12": nfo.thumb,
         "c13": nfo.imdb_id,
@@ -562,7 +563,7 @@ def upsert_movie(
         c00 = title          c01 = outline (plot summary)
         c02 = plot           c03 = tagline
         c06 = writers        c07 = year
-        c10 = directors      c11 = original title
+        c10 = sort title     c11 = original title
         c12 = thumb URL      c13 = IMDB id
         c14 = genre          c15 = country
         c22 = full SMB path  premiered = premiered / year
