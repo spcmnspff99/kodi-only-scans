@@ -177,6 +177,8 @@
           <th>#</th>
           <th>Started</th>
           <th>Finished</th>
+          <th>Triggered By</th>
+          <th>Target</th>
           <th>Status</th>
           <th>Movies</th>
           <th>Episodes</th>
@@ -187,10 +189,18 @@
         {% for row in history %}
         <tr>
           <td>{{ row.id }}</td>
-          <td>{{ row.started_at | replace("T", " ") | truncate(19, True, "") }}</td>
+          <td>{{ row.started_at_display }}</td>
           <td>
             {% if row.finished_at %}
-              {{ row.finished_at | replace("T", " ") | truncate(19, True, "") }}
+              {{ row.finished_at_display }}
+            {% else %}
+              <em style="color:#4a5a6a">—</em>
+            {% endif %}
+          </td>
+          <td>{{ row.trigger_source or "unknown" }}</td>
+          <td>
+            {% if row.trigger_target %}
+              <span style="font-size:0.78rem;color:#9cb0c6;word-break:break-all">{{ row.trigger_target }}</span>
             {% else %}
               <em style="color:#4a5a6a">—</em>
             {% endif %}
@@ -259,7 +269,7 @@
     msg.textContent = "⏳ Scan triggered – running in background…";
 
     try {
-      const resp = await fetch("/scan", { method: "POST" });
+      const resp = await fetch("/scan?source=dashboard", { method: "POST" });
       const data = await resp.json();
       msg.textContent = "✅ " + (data.status ?? "Scan started");
     } catch (err) {

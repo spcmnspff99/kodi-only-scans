@@ -105,6 +105,26 @@ def _normalize_target_path(target_path: str) -> str:
     return target_path.replace("\\", "/")
 
 
+def _now_local_iso() -> str:
+    """Return current local time with offset in ISO-8601 format."""
+    return datetime.now().astimezone().isoformat()
+
+
+def _to_local_display(ts: str | None) -> str:
+    """Format an ISO timestamp as local wall time for dashboard display."""
+    if not ts:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except ValueError:
+        return ts
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    else:
+        parsed = parsed.astimezone()
+    return parsed.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _looks_like_file_path(path_value: str) -> bool:
     filename = posixpath.basename(path_value.rstrip("/"))
     return bool(filename) and bool(posixpath.splitext(filename)[1])
@@ -225,6 +245,14 @@ def init_history_db() -> None:
         """
     )
     conn.commit()
+
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(scan_history)").fetchall()}
+    if "trigger_source" not in cols:
+        conn.execute("ALTER TABLE scan_history ADD COLUMN trigger_source TEXT NOT NULL DEFAULT 'unknown'")
+    if "trigger_target" not in cols:
+        conn.execute("ALTER TABLE scan_history ADD COLUMN trigger_target TEXT NOT NULL DEFAULT ''")
+    conn.commit()
+
     conn.close()
     _prune_history()
 
@@ -241,7 +269,7 @@ def _prune_history() -> int:
     if HISTORY_RETENTION_DAYS <= 0:
         return 0
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=HISTORY_RETENTION_DAYS)
+    cutoff = datetime.now().astimezone() - timedelta(days=HISTORY_RETENTION_DAYS)
     cutoff_iso = cutoff.isoformat()
 
     conn = _history_conn()
@@ -262,12 +290,15 @@ def _prune_history() -> int:
     return deleted
 
 
-def _start_scan_record() -> int:
+def _start_scan_record(trigger_source: str = "unknown", trigger_target: str = "") -> int:
     _prune_history()
     conn = _history_conn()
     cur = conn.execute(
-        "INSERT INTO scan_history (started_at, status) VALUES (?, 'running')",
-        (datetime.now(timezone.utc).isoformat(),),
+        """
+        INSERT INTO scan_history (started_at, status, trigger_source, trigger_target)
+        VALUES (?, 'running', ?, ?)
+        """,
+        (_now_local_iso(), trigger_source, trigger_target),
     )
     conn.commit()
     scan_id = cur.lastrowid
@@ -290,7 +321,7 @@ def _finish_scan_record(
         WHERE id = ?
         """,
         (
-            datetime.now(timezone.utc).isoformat(),
+            _now_local_iso(),
             status,
             movies_added,
             episodes_added,
@@ -310,7 +341,11 @@ def get_history() -> list:
         "SELECT * FROM scan_history ORDER BY id DESC LIMIT 50"
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+    for row in result:
+        row["started_at_display"] = _to_local_display(row.get("started_at"))
+        row["finished_at_display"] = _to_local_display(row.get("finished_at"))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +370,7 @@ def _legacy_run_scan() -> None:
         logger.warning("SMB_HOST or DB_HOST not configured – scan skipped.")
         return
 
-    scan_id = _start_scan_record()
+    scan_id = _start_scan_record("legacy")
     movies_added = 0
     episodes_added = 0
     errors: list = []
@@ -417,13 +452,13 @@ def _legacy_run_scan() -> None:
     )
 
 
-def run_scan(target_path: str | None = None) -> None:
+def run_scan(target_path: str | None = None, trigger_source: str = "unknown") -> None:
     """Full scan by default, or a targeted scan when *target_path* is provided."""
     if not SMB_HOST or not DB_HOST:
         logger.warning("SMB_HOST or DB_HOST not configured – scan skipped.")
         return
 
-    scan_id = _start_scan_record()
+    scan_id = _start_scan_record(trigger_source, target_path or "")
     movies_added = 0
     episodes_added = 0
     errors: list = []
@@ -705,7 +740,7 @@ def _schedule_scan() -> None:
 async def _async_scan() -> None:
     """Async wrapper: run the blocking scan in a thread-pool executor."""
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, run_scan)
+    await loop.run_in_executor(None, run_scan, None, "scheduled")
 
 
 def run_movie_dedupe_maintenance() -> int:
@@ -848,7 +883,12 @@ async def dashboard(request: Request):
 async def trigger_scan(request: Request, background_tasks: BackgroundTasks):
     """Kick off an immediate scan as a FastAPI background task."""
     target_path = await _extract_target_path(request)
-    background_tasks.add_task(run_scan, target_path)
+    source = (request.query_params.get("source") or "").strip().lower()
+    if source == "dashboard":
+        trigger_source = "dashboard"
+    else:
+        trigger_source = "api_scan"
+    background_tasks.add_task(run_scan, target_path, trigger_source)
     payload = {"status": "scan triggered"}
     if target_path:
         payload["target_path"] = target_path
@@ -891,7 +931,7 @@ async def kodi_jsonrpc(request: Request, background_tasks: BackgroundTasks):
 
     params = payload.get("params") or {}
     target_path = params.get("directory") or params.get("path") or params.get("file") or params.get("target")
-    background_tasks.add_task(run_scan, target_path)
+    background_tasks.add_task(run_scan, target_path, "jsonrpc")
     return JSONResponse({"jsonrpc": "2.0", "id": request_id, "result": "OK"}, status_code=200)
 
 
