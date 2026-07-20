@@ -37,7 +37,7 @@ from fastapi.templating import Jinja2Templates
 
 import smbclient
 
-from db_ops import dedupe_movies, get_connection, get_or_create_tvshow, upsert_episode, upsert_movie
+from db_ops import dedupe_movies, get_connection, get_or_create_tvshow, rebuild_movie_sort_titles, upsert_episode, upsert_movie
 from nfo_parser import MovieNfo, guess_movie_from_filename, parse_episode_nfo, parse_movie_nfo, parse_tvshow_nfo
 from smb_walker import (
     VideoFile,
@@ -364,10 +364,6 @@ def _legacy_run_scan() -> None:
                 ep_count = _process_tvshow(db_conn, SMB_TV_SHARE, show_name, show_rel, show_uri, errors)
                 episodes_added += ep_count
 
-            removed = dedupe_movies(db_conn)
-            if removed:
-                logger.info("Removed %d duplicate movie rows", removed)
-
         finally:
             db_conn.close()
 
@@ -455,10 +451,6 @@ def run_scan(target_path: str | None = None) -> None:
                         build_smb_dir_uri(SMB_HOST, target["share"], show_root_rel),
                         errors,
                     )
-
-            removed = dedupe_movies(db_conn)
-            if removed:
-                logger.info("Removed %d duplicate movie rows", removed)
 
         finally:
             db_conn.close()
@@ -660,6 +652,38 @@ async def _async_scan() -> None:
     await loop.run_in_executor(None, run_scan)
 
 
+def run_movie_dedupe_maintenance() -> int:
+    """Run movie dedupe as an explicit dashboard maintenance task."""
+    if not DB_HOST:
+        raise RuntimeError("DB_HOST not configured")
+
+    db_conn = get_connection(DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME)
+    try:
+        removed = dedupe_movies(db_conn)
+        logger.info("Maintenance dedupe complete: removed=%d", removed)
+        return removed
+    finally:
+        db_conn.close()
+
+
+def run_movie_sort_title_rebuild_maintenance() -> dict:
+    """Rebuild movie sort titles as an explicit dashboard maintenance task."""
+    if not DB_HOST:
+        raise RuntimeError("DB_HOST not configured")
+
+    db_conn = get_connection(DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME)
+    try:
+        result = rebuild_movie_sort_titles(db_conn)
+        logger.info(
+            "Maintenance sort-title rebuild complete: updated=%d total=%d",
+            result.get("updated", 0),
+            result.get("total", 0),
+        )
+        return result
+    finally:
+        db_conn.close()
+
+
 app = FastAPI(title="Kodi Only Scans", lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
 
@@ -681,6 +705,20 @@ async def trigger_scan(request: Request, background_tasks: BackgroundTasks):
     if target_path:
         payload["target_path"] = target_path
     return JSONResponse(payload, status_code=202)
+
+
+@app.post("/dashboard/maintenance/dedupe")
+async def trigger_movie_dedupe(background_tasks: BackgroundTasks):
+    """Dashboard-only trigger for movie dedupe maintenance."""
+    background_tasks.add_task(run_movie_dedupe_maintenance)
+    return JSONResponse({"status": "movie dedupe triggered"}, status_code=202)
+
+
+@app.post("/dashboard/maintenance/rebuild-sort-titles")
+async def trigger_movie_sort_title_rebuild(background_tasks: BackgroundTasks):
+    """Dashboard-only trigger for movie sort-title rebuild maintenance."""
+    background_tasks.add_task(run_movie_sort_title_rebuild_maintenance)
+    return JSONResponse({"status": "movie sort-title rebuild triggered"}, status_code=202)
 
 
 @app.post("/jsonrpc")

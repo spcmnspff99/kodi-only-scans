@@ -406,6 +406,37 @@ def dedupe_movies(conn) -> int:
         return removed
 
 
+def rebuild_movie_sort_titles(conn) -> dict:
+    """Rebuild movie sort titles (c10) from title (c00) for all movies.
+
+    Returns a small summary dictionary with total rows inspected and rows
+    updated.
+    """
+    with transaction(conn):
+        with conn.cursor() as cur:
+            cur.execute("SELECT idMovie, c00, c10 FROM movie ORDER BY idMovie ASC")
+            rows = cur.fetchall() or []
+
+        updated = 0
+        for row in rows:
+            title = (row.get("c00") or "").strip()
+            current_sort = (row.get("c10") or "").strip()
+
+            # Keep sort title aligned with displayed title for a full reset.
+            desired_sort = title
+            if current_sort == desired_sort:
+                continue
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE movie SET c10 = %s WHERE idMovie = %s",
+                    (desired_sort, int(row["idMovie"])),
+                )
+            updated += 1
+
+        return {"total": len(rows), "updated": updated}
+
+
 def _movie_default_video_version_exists(conn, idMovie: int, idFile: int) -> bool:
     with conn.cursor() as cur:
         cur.execute(
@@ -625,7 +656,7 @@ def upsert_movie(
                     nfo.tagline,                        # c03
                     " / ".join(nfo.writer),             # c06
                     nfo.year,                           # c07
-                    " / ".join(nfo.director),           # c10
+                    nfo.sorttitle or nfo.title,         # c10
                     nfo.originaltitle,                  # c11
                     nfo.thumb,                          # c12
                     nfo.imdb_id,                        # c13

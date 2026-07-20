@@ -38,8 +38,14 @@
 
     header h1 span { color: #5b9bd5; }
 
-    /* ── Scan button ───────────────────────────────────────────────── */
-    #scanBtn {
+    /* ── Action buttons ────────────────────────────────────────────── */
+    .button-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem;
+    }
+
+    .action-btn {
       background: #5b9bd5;
       color: #fff;
       border: none;
@@ -50,9 +56,14 @@
       cursor: pointer;
       transition: background 0.2s;
     }
-    #scanBtn:hover  { background: #4a88c4; }
-    #scanBtn:active { background: #3a74b0; }
-    #scanBtn:disabled { background: #3a4a5a; cursor: not-allowed; }
+    .action-btn:hover  { background: #4a88c4; }
+    .action-btn:active { background: #3a74b0; }
+    .action-btn:disabled { background: #3a4a5a; cursor: not-allowed; }
+
+    #dedupeBtn { background: #2e8b57; }
+    #dedupeBtn:hover { background: #267447; }
+    #sortTitleBtn { background: #8b6f2e; }
+    #sortTitleBtn:hover { background: #745c26; }
 
     /* ── Status banner ─────────────────────────────────────────────── */
     #statusMsg {
@@ -144,7 +155,11 @@
   <header>
     <h1>🎬 Kodi <span>Only</span> Scans</h1>
     <div>
-      <button id="scanBtn" onclick="triggerScan()">▶ Scan Now</button>
+      <div class="button-row">
+        <button id="scanBtn" class="action-btn" onclick="triggerScan()">▶ Scan Now</button>
+        <button id="dedupeBtn" class="action-btn" onclick="triggerMovieDedupe()">🧹 Deduplicate Movies</button>
+        <button id="sortTitleBtn" class="action-btn" onclick="rebuildMovieSortTitles()">🔤 Rebuild Movie Sort Titles</button>
+      </div>
       <div id="statusMsg"></div>
     </div>
   </header>
@@ -208,10 +223,8 @@
 
 <script>
   async function triggerScan() {
-    const btn = document.getElementById("scanBtn");
     const msg = document.getElementById("statusMsg");
-
-    btn.disabled = true;
+    setActionButtonsDisabled(true);
     msg.textContent = "⏳ Scan triggered – running in background…";
 
     try {
@@ -223,7 +236,52 @@
     } finally {
       // Re-enable button after a short delay and refresh history
       setTimeout(() => {
-        btn.disabled = false;
+        setActionButtonsDisabled(false);
+        window.location.reload();
+      }, 3000);
+    }
+  }
+
+  function setActionButtonsDisabled(disabled) {
+    for (const id of ["scanBtn", "dedupeBtn", "sortTitleBtn"]) {
+      const btn = document.getElementById(id);
+      if (btn) btn.disabled = disabled;
+    }
+  }
+
+  async function triggerMovieDedupe() {
+    const msg = document.getElementById("statusMsg");
+    setActionButtonsDisabled(true);
+    msg.textContent = "🧹 Movie dedupe triggered – running in background…";
+
+    try {
+      const resp = await fetch("/dashboard/maintenance/dedupe", { method: "POST" });
+      const data = await resp.json();
+      msg.textContent = "✅ " + (data.status ?? "Movie dedupe started");
+    } catch (err) {
+      msg.textContent = "❌ Failed to trigger movie dedupe: " + err;
+    } finally {
+      setTimeout(() => {
+        setActionButtonsDisabled(false);
+        window.location.reload();
+      }, 3000);
+    }
+  }
+
+  async function rebuildMovieSortTitles() {
+    const msg = document.getElementById("statusMsg");
+    setActionButtonsDisabled(true);
+    msg.textContent = "🔤 Sort-title rebuild triggered – running in background…";
+
+    try {
+      const resp = await fetch("/dashboard/maintenance/rebuild-sort-titles", { method: "POST" });
+      const data = await resp.json();
+      msg.textContent = "✅ " + (data.status ?? "Sort-title rebuild started");
+    } catch (err) {
+      msg.textContent = "❌ Failed to trigger sort-title rebuild: " + err;
+    } finally {
+      setTimeout(() => {
+        setActionButtonsDisabled(false);
         window.location.reload();
       }, 3000);
     }
