@@ -720,12 +720,18 @@ def _enqueue_scan(target_path: str | None, trigger_source: str) -> dict:
 
     with _scan_state_lock:
         is_running = _active_scan_key is not None
-        if key in _queued_scan_keys:
+        is_same_path_running = _active_scan_key == key
+        has_same_path_pending = key in _queued_scan_keys
+
+        # Consolidate only with *pending* queued entries for the same key.
+        # A currently-running same-path scan does not block adding one queued retry.
+        if has_same_path_pending:
             payload = {
                 "status": "scan already queued",
                 "trigger_source": trigger_source,
                 "consolidated": True,
                 "currently_running": is_running,
+                "same_path_running": is_same_path_running,
                 "queue_depth": len(_scan_queue),
             }
         else:
@@ -742,6 +748,7 @@ def _enqueue_scan(target_path: str | None, trigger_source: str) -> dict:
                 "trigger_source": trigger_source,
                 "consolidated": False,
                 "currently_running": is_running,
+                "same_path_running": is_same_path_running,
                 "queue_depth": len(_scan_queue),
             }
             if _scan_worker_thread is None or not _scan_worker_thread.is_alive():
