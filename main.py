@@ -105,6 +105,21 @@ def _normalize_target_path(target_path: str) -> str:
     return target_path.replace("\\", "/")
 
 
+def _is_api_test_target_path(target_path: str | None) -> bool:
+    """Return True for known Radarr/Sonarr notifier test paths."""
+    if not target_path:
+        return False
+    normalized = _normalize_target_path(target_path).lower().strip().rstrip("/")
+    compact = "".join(ch for ch in normalized if not ch.isspace())
+
+    # Matches common notifier test values and JSON-escaped variants.
+    if compact in {"c:/testpath", "c:/test/path", "c:testpath", "/testpath", "testpath"}:
+        return True
+
+    # Some JSON payloads send "C:\testpath" as "C:\testpath" where \t becomes a tab.
+    return compact.startswith("c:") and compact.endswith("estpath")
+
+
 def _now_local_iso() -> str:
     """Return current local time with offset in ISO-8601 format."""
     return datetime.now().astimezone().isoformat()
@@ -456,6 +471,16 @@ def run_scan(target_path: str | None = None, trigger_source: str = "unknown") ->
     """Full scan by default, or a targeted scan when *target_path* is provided."""
     if not SMB_HOST or not DB_HOST:
         logger.warning("SMB_HOST or DB_HOST not configured – scan skipped.")
+        return
+
+    if _is_api_test_target_path(target_path):
+        logger.info(
+            "Skipping scan for API test target path %r (source=%s)",
+            target_path,
+            trigger_source,
+        )
+        scan_id = _start_scan_record(trigger_source, target_path or "")
+        _finish_scan_record(scan_id, "completed", 0, 0, "skipped api test target")
         return
 
     scan_id = _start_scan_record(trigger_source, target_path or "")
