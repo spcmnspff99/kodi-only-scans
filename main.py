@@ -25,7 +25,7 @@ import posixpath
 import sqlite3
 import traceback
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import uvicorn
@@ -83,6 +83,7 @@ DB_NAME = os.environ.get("DB_NAME", "MyVideos131")
 
 SCAN_CRON = os.environ.get("SCAN_CRON", "0 4 * * *")
 HISTORY_DB = os.environ.get("HISTORY_DB", "/data/scan_history.db")
+HISTORY_RETENTION_DAYS = int(os.environ.get("HISTORY_RETENTION_DAYS", "7"))
 
 
 def _normalize_target_path(target_path: str) -> str:
@@ -189,13 +190,44 @@ def init_history_db() -> None:
     )
     conn.commit()
     conn.close()
+    _prune_history()
 
 
 def _history_conn() -> sqlite3.Connection:
     return sqlite3.connect(HISTORY_DB)
 
 
+def _prune_history() -> int:
+    """Delete scan history rows older than HISTORY_RETENTION_DAYS.
+
+    Set HISTORY_RETENTION_DAYS to 0 or a negative number to disable pruning.
+    """
+    if HISTORY_RETENTION_DAYS <= 0:
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=HISTORY_RETENTION_DAYS)
+    cutoff_iso = cutoff.isoformat()
+
+    conn = _history_conn()
+    cur = conn.execute(
+        "DELETE FROM scan_history WHERE started_at < ?",
+        (cutoff_iso,),
+    )
+    conn.commit()
+    deleted = int(cur.rowcount or 0)
+    conn.close()
+
+    if deleted:
+        logger.info(
+            "Pruned %d scan history rows older than %d days",
+            deleted,
+            HISTORY_RETENTION_DAYS,
+        )
+    return deleted
+
+
 def _start_scan_record() -> int:
+    _prune_history()
     conn = _history_conn()
     cur = conn.execute(
         "INSERT INTO scan_history (started_at, status) VALUES (?, 'running')",

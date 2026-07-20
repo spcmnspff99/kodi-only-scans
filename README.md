@@ -46,6 +46,9 @@ SCAN_CRON=0 4 * * *         # Default: daily at 04:00 America/Boise local time
 
 # Path inside the container for the SQLite history DB
 HISTORY_DB=/data/scan_history.db
+
+# Keep only the last N days of scan history (0 disables pruning)
+HISTORY_RETENTION_DAYS=7
 ```
 
 ## Deployment
