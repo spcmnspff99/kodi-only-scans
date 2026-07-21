@@ -16,10 +16,18 @@ Usage
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator, List, Optional
 
 import smbclient
+
+from sidecars import (
+    SubtitleSidecar,
+    dedupe_vobsub_pairs,
+    is_sample_file,
+    is_trailer_file,
+    parse_subtitle_filename,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +54,10 @@ class VideoFile:
     nfo_unc: Optional[str]  # \\server\share\path\to\file.nfo, or None if absent
     poster_unc: Optional[str]  # \\server\share\path\to\poster.jpg, or None if absent
     fanart_unc: Optional[str]  # \\server\share\path\to\fanart.jpg, or None if absent
+    dir_files: tuple = ()        # all file names in the containing directory (shared tuple)
+    subtitles: List[SubtitleSidecar] = field(default_factory=list)
+    is_trailer: bool = False     # '<stem>-trailer.<ext>' style file
+    is_sample: bool = False      # '<stem>-sample.<ext>' style file
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +128,19 @@ def list_smb_files(unc_path: str) -> List[str]:
     except Exception as exc:
         logger.warning("Cannot list files of %s: %s", unc_path, exc)
         return []
+
+
+def list_smb_files_strict(unc_path: str) -> Optional[List[str]]:
+    """Like :func:`list_smb_files` but returns ``None`` on error.
+
+    Callers use the ``None`` sentinel to distinguish "directory is empty" from
+    "directory could not be listed" before running destructive reconciliation.
+    """
+    try:
+        return [e.name for e in smbclient.scandir(unc_path) if not e.is_dir(follow_symlinks=False)]
+    except Exception as exc:
+        logger.warning("Cannot list files of %s: %s", unc_path, exc)
+        return None
 
 
 def smb_dir_exists(unc_path: str) -> bool:
@@ -351,6 +376,7 @@ def _walk(server: str, share: str, unc_dir: str) -> Iterator[VideoFile]:
 
     # Build a case-insensitive lookup once for predictable art sidecar matching.
     lower_file_names = {name.lower(): name for name in file_names}
+    all_files = tuple(sorted(file_names))
 
     # Yield video files in this directory
     for fname in file_names:
@@ -387,6 +413,11 @@ def _walk(server: str, share: str, unc_dir: str) -> Iterator[VideoFile]:
                 fanart_unc = f"{unc_dir}\\{matched}"
                 break
 
+        subtitles = dedupe_vobsub_pairs([
+            sub for name in file_names
+            if (sub := parse_subtitle_filename(stem, name)) is not None
+        ])
+
         dir_smb_uri = _unc_to_smb_dir_uri(server, share, unc_dir)
 
         yield VideoFile(
@@ -398,6 +429,10 @@ def _walk(server: str, share: str, unc_dir: str) -> Iterator[VideoFile]:
             nfo_unc=nfo_unc,
             poster_unc=poster_unc,
             fanart_unc=fanart_unc,
+            dir_files=all_files,
+            subtitles=subtitles,
+            is_trailer=is_trailer_file(fname),
+            is_sample=is_sample_file(fname),
         )
 
     # Recurse

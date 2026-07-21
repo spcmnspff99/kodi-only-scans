@@ -109,6 +109,14 @@ def _parse_root(content: str) -> Optional[ET.Element]:
         return None
 
 
+_XML_DECL_RE = re.compile(r"<\?xml[^?]*\?>", re.IGNORECASE)
+
+
+def _strip_xml_decls(content: str) -> str:
+    """Remove ``<?xml ...?>`` declarations (they can repeat in multi-block NFOs)."""
+    return _XML_DECL_RE.sub("", content)
+
+
 # ---------------------------------------------------------------------------
 # Public parsers
 # ---------------------------------------------------------------------------
@@ -191,12 +199,8 @@ def parse_tvshow_nfo(content: str) -> Optional[TvShowNfo]:
     return nfo
 
 
-def parse_episode_nfo(content: str) -> Optional[EpisodeNfo]:
-    """Parse an episode .nfo XML string.  Returns None if not <episodedetails>."""
-    root = _parse_root(content)
-    if root is None or root.tag != "episodedetails":
-        return None
-
+def _episode_nfo_from_element(root: ET.Element) -> EpisodeNfo:
+    """Build an :class:`EpisodeNfo` from an ``<episodedetails>`` element."""
     nfo = EpisodeNfo()
     nfo.title = _text(root, "title")
     nfo.originaltitle = _text(root, "originaltitle")
@@ -220,6 +224,40 @@ def parse_episode_nfo(content: str) -> Optional[EpisodeNfo]:
         nfo.thumb = (thumb_el.text or "").strip()
 
     return nfo
+
+
+def parse_episode_nfo(content: str) -> Optional[EpisodeNfo]:
+    """Parse an episode .nfo XML string.  Returns None if not <episodedetails>."""
+    nfos = parse_episode_nfos(content)
+    return nfos[0] if nfos else None
+
+
+def parse_episode_nfos(content: str) -> List[EpisodeNfo]:
+    """Parse one *or more* ``<episodedetails>`` blocks from an .nfo string.
+
+    Sonarr writes multi-episode files (e.g. ``S01E01E02.mkv``) as several
+    concatenated ``<episodedetails>`` documents, each with its own optional
+    ``<?xml?>`` declaration.  We strip declarations, try a plain parse first,
+    then fall back to wrapping the content in a synthetic root element.
+    """
+    cleaned = _strip_xml_decls(content).strip()
+    if not cleaned:
+        return []
+
+    root = _parse_root(cleaned)
+    if root is not None:
+        if root.tag != "episodedetails":
+            return []
+        return [_episode_nfo_from_element(root)]
+
+    wrapped = _parse_root(f"<episodelist>{cleaned}</episodelist>")
+    if wrapped is None:
+        return []
+
+    return [
+        _episode_nfo_from_element(el)
+        for el in wrapped.findall("episodedetails")
+    ]
 
 
 def guess_movie_from_filename(filename: str) -> Optional[MovieGuess]:

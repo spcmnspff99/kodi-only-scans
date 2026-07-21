@@ -20,6 +20,7 @@ Environment variables (see .env.example)
 
 from collections import deque
 from dataclasses import dataclass
+from itertools import groupby
 import logging
 import os
 import posixpath
@@ -43,21 +44,34 @@ from db_ops import (
     backfill_movie_art_if_missing,
     backfill_tvshow_art_if_missing,
     dedupe_movies,
+    delete_file_by_location,
+    delete_movie_by_dir,
+    delete_tvshow_by_dir,
+    ensure_season,
+    find_movie_id_by_dir,
     get_connection,
+    get_file_id,
     get_movies_missing_artwork,
     get_or_create_tvshow,
     get_tvshows_missing_artwork,
     rebuild_movie_sort_titles,
-    upsert_episode,
+    reconcile_directory,
+    register_movie_extra,
+    sync_subtitle_streams,
+    upsert_art_batch,
+    upsert_episodes_for_file,
     upsert_movie,
 )
-from nfo_parser import MovieNfo, guess_movie_from_filename, parse_episode_nfo, parse_movie_nfo, parse_tvshow_nfo
+from nfo_parser import MovieNfo, guess_movie_from_filename, parse_episode_nfos, parse_movie_nfo, parse_tvshow_nfo
+from sidecars import classify_art_file, extras_folder_type
 from smb_walker import (
+    VIDEO_EXTENSIONS,
     VideoFile,
     build_smb_dir_uri,
     build_smb_file_uri,
     build_unc,
     list_smb_files,
+    list_smb_files_strict,
     list_smb_subdirs,
     read_smb_file,
     resolve_share_path,
@@ -109,6 +123,8 @@ class ScanRequest:
     key: str
     target_path: str | None
     trigger_source: str
+    action: str = "scan"          # "scan" | "delete"
+    event_type: str = ""          # Sonarr/Radarr eventType for deletes
 
 
 _scan_state_lock = threading.Lock()
@@ -126,6 +142,8 @@ def _queue_state_snapshot() -> dict:
                 "target_path": req.target_path or "",
                 "trigger_source": req.trigger_source,
                 "is_full_scan": req.key == FULL_SCAN_KEY,
+                "action": req.action,
+                "event_type": req.event_type,
             }
             for req in _scan_queue
         ]
@@ -467,9 +485,10 @@ def _legacy_run_scan() -> None:
                 "Scanning movies: smb://%s/%s/%s", SMB_HOST, SMB_MOVIES_SHARE, movies_path
             )
             for vf in walk_videos(SMB_HOST, SMB_MOVIES_SHARE, movies_path):
+                if vf.is_trailer or vf.is_sample:
+                    continue
                 try:
-                    result = _process_movie(db_conn, vf)
-                    if result is not None:
+                    if _process_movie(db_conn, vf):
                         movies_added += 1
                 except Exception as exc:
                     msg = f"Movie {vf.filename}: {exc}"
@@ -560,7 +579,7 @@ def run_scan(target_path: str | None = None, trigger_source: str = "unknown") ->
                     logger.warning(msg)
                     errors.append(msg)
 
-                movies_added += _scan_movies_tree(db_conn, SMB_MOVIES_SHARE, movies_path, errors)
+                movies_added += _scan_movies_tree(db_conn, SMB_MOVIES_SHARE, movies_path, errors)[0]
                 episodes_added += _scan_tv_library(db_conn, SMB_TV_SHARE, tv_path, errors)
             else:
                 logger.info("Targeted scan requested: %s", target_path)
@@ -570,7 +589,12 @@ def run_scan(target_path: str | None = None, trigger_source: str = "unknown") ->
                     )
                     target_unc = build_unc(SMB_HOST, target["share"], scan_rel)
                     if smb_dir_exists(target_unc):
-                        movies_added += _scan_movies_tree(db_conn, target["share"], scan_rel, errors)
+                        added, dirs_seen = _scan_movies_tree(db_conn, target["share"], scan_rel, errors)
+                        movies_added += added
+                        if dirs_seen == 0:
+                            # No videos found – possibly a deletion. Reconcile the
+                            # scan root only when the listing genuinely succeeded.
+                            _reconcile_empty_scan_root(db_conn, target["share"], scan_rel, errors)
                     else:
                         logger.warning(
                             "Target movie path not found: %s. Falling back to full movies root scan.",
@@ -582,7 +606,7 @@ def run_scan(target_path: str | None = None, trigger_source: str = "unknown") ->
                             SMB_MOVIES_PATH,
                             library_type="movies",
                         )
-                        movies_added += _scan_movies_tree(db_conn, target["share"], root_movies_path, errors)
+                        movies_added += _scan_movies_tree(db_conn, target["share"], root_movies_path, errors)[0]
                 else:
                     scan_rel = resolve_share_path(
                         SMB_HOST, target["share"], target["scan_rel"], library_type="tv"
@@ -617,20 +641,135 @@ def run_scan(target_path: str | None = None, trigger_source: str = "unknown") ->
     )
 
 
-async def _extract_target_path(request: Request) -> Optional[str]:
-    """Extract a target path from query params or a JSON body."""
+# ---------------------------------------------------------------------------
+# Delete events (Sonarr/Radarr webhooks)
+# ---------------------------------------------------------------------------
+
+_DELETE_EVENTS = {"moviefiledelete", "episodefiledelete", "moviedelete", "seriesdelete"}
+_SKIP_EVENTS = {"test"}
+
+
+def _is_delete_event(event_type: str) -> bool:
+    return (event_type or "").strip().lower() in _DELETE_EVENTS
+
+
+def _is_skip_event(event_type: str) -> bool:
+    return (event_type or "").strip().lower() in _SKIP_EVENTS
+
+
+def _resolve_delete_target(target_path: str):
+    """Resolve a delete webhook path to ``(share, rel_path, is_file)``.
+
+    Unlike :func:`_resolve_scan_target` this keeps the trailing filename –
+    file-delete events need it.  Pure string handling; no SMB access (the
+    file is usually already gone by the time the webhook arrives).
+    """
+    normalized = _normalize_target_path(target_path)
+    parts = [part for part in normalized.split("/") if part]
+    for share_name in (SMB_MOVIES_SHARE, SMB_TV_SHARE):
+        if not share_name:
+            continue
+        share_index = next(
+            (idx for idx, part in enumerate(parts) if part.lower() == share_name.lower()),
+            None,
+        )
+        if share_index is None:
+            continue
+        rel = "/".join(parts[share_index + 1:]).strip("/\\")
+        return share_name, rel, _looks_like_file_path(rel)
+    return None
+
+
+def _dispatch_delete(db_conn, target_path: str, event: str, errors: list) -> dict:
+    """Execute the DB cascade for one delete event.  Returns removal counts."""
+    counts = {"movies": 0, "episodes": 0}
+    if not target_path:
+        errors.append(f"{event}: no target path in webhook payload")
+        return counts
+
+    resolved = _resolve_delete_target(target_path)
+    if resolved is None:
+        msg = f"{event}: target does not map to a configured share: {target_path}"
+        logger.warning(msg)
+        errors.append(msg)
+        return counts
+
+    share, rel, is_file = resolved
+
+    if event in ("moviefiledelete", "episodefiledelete"):
+        if not is_file:
+            errors.append(f"{event}: target is not a file path: {target_path}")
+            return counts
+        directory_uri = build_smb_dir_uri(SMB_HOST, share, posixpath.dirname(rel))
+        filename = posixpath.basename(rel)
+        if delete_file_by_location(db_conn, directory_uri, filename):
+            logger.info("Deleted %s%s (event=%s)", directory_uri, filename, event)
+            counts["movies" if event == "moviefiledelete" else "episodes"] = 1
+        else:
+            logger.info("%s: %s not present in DB – nothing to delete", event, target_path)
+        return counts
+
+    if event == "moviedelete":
+        counts["movies"] = delete_movie_by_dir(db_conn, build_smb_dir_uri(SMB_HOST, share, rel))
+        logger.info("MovieDelete under %s removed %d movie(s)", rel, counts["movies"])
+        return counts
+
+    if event == "seriesdelete":
+        removed = delete_tvshow_by_dir(db_conn, build_smb_dir_uri(SMB_HOST, share, rel))
+        counts["episodes"] = 1 if removed else 0
+        logger.info("SeriesDelete for %s: show %s", rel, "removed" if removed else "not found")
+        return counts
+
+    errors.append(f"Unhandled delete event: {event}")
+    return counts
+
+
+def run_delete(target_path: str | None, event_type: str, trigger_source: str) -> None:
+    """Process a Sonarr/Radarr delete webhook (DB-only; no SMB reads)."""
+    event = (event_type or "").strip().lower()
+    scan_id = _start_scan_record(f"{trigger_source}:{event}", target_path or "")
+    counts = {"movies": 0, "episodes": 0}
+    errors: list = []
+
+    try:
+        db_conn = get_connection(DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME)
+        try:
+            counts = _dispatch_delete(db_conn, target_path or "", event, errors)
+        finally:
+            db_conn.close()
+    except Exception as exc:
+        msg = f"Fatal delete error: {exc}\n{traceback.format_exc()}"
+        logger.error(msg)
+        errors.append(msg)
+        _finish_scan_record(scan_id, "failed", 0, 0, "\n".join(errors))
+        return
+
+    status = "completed" if not errors else "completed_with_errors"
+    _finish_scan_record(scan_id, status, counts["movies"], counts["episodes"], "\n".join(errors))
+    logger.info(
+        "Delete finished – event=%s target=%r movies=%d episodes=%d status=%s",
+        event, target_path, counts["movies"], counts["episodes"], status,
+    )
+
+
+async def _extract_webhook_payload(request: Request) -> tuple:
+    """Extract ``(target_path, event_type)`` from query params or a JSON body.
+
+    Sonarr/Radarr put ``eventType`` at the top level of the JSON body; the
+    path can be nested (movieFile.path, episodeFile.path, series.path, ...).
+    """
     for key in ("path", "directory", "file", "target"):
         value = request.query_params.get(key)
         if value:
-            return value
+            return value, ""
 
     try:
         payload = await request.json()
     except Exception:
-        return None
+        return None, ""
 
     if not isinstance(payload, dict):
-        return None
+        return None, ""
 
     # Radarr/Sonarr payloads often nest the useful path under movie/movieFile/series.
     candidate_keys = (
@@ -660,7 +799,10 @@ async def _extract_target_path(request: Request) -> Optional[str]:
                     return found
         return None
 
-    return _find_path(payload)
+    event_type = payload.get("eventType")
+    if not isinstance(event_type, str):
+        event_type = ""
+    return _find_path(payload), event_type.strip()
 
 
 def _normalize_trigger_source(request: Request) -> str:
@@ -678,11 +820,12 @@ def _normalize_trigger_source(request: Request) -> str:
     return "api_scan"
 
 
-def _scan_key_for_target(target_path: str | None) -> str:
+def _scan_key_for_target(target_path: str | None, action: str = "scan") -> str:
+    prefix = "" if action == "scan" else f"{action}:"
     if not target_path:
-        return FULL_SCAN_KEY
+        return f"{prefix}{FULL_SCAN_KEY}" if prefix else FULL_SCAN_KEY
     normalized = _normalize_target_path(target_path).lower().rstrip("/")
-    return normalized or FULL_SCAN_KEY
+    return f"{prefix}{normalized}" if normalized else f"{prefix}{FULL_SCAN_KEY}"
 
 
 def _scan_worker_loop() -> None:
@@ -700,22 +843,31 @@ def _scan_worker_loop() -> None:
             remaining = len(_scan_queue)
 
         logger.info(
-            "Starting queued scan: source=%s target=%r queue_remaining=%d",
+            "Starting queued %s: source=%s target=%r queue_remaining=%d",
+            request.action,
             request.trigger_source,
             request.target_path,
             remaining,
         )
         try:
-            run_scan(request.target_path, request.trigger_source)
+            if request.action == "delete":
+                run_delete(request.target_path, request.event_type, request.trigger_source)
+            else:
+                run_scan(request.target_path, request.trigger_source)
         finally:
             with _scan_state_lock:
                 _active_scan_key = None
 
 
-def _enqueue_scan(target_path: str | None, trigger_source: str) -> dict:
+def _enqueue_scan(
+    target_path: str | None,
+    trigger_source: str,
+    action: str = "scan",
+    event_type: str = "",
+) -> dict:
     global _scan_worker_thread
 
-    key = _scan_key_for_target(target_path)
+    key = _scan_key_for_target(target_path, action)
     worker_should_start = False
 
     with _scan_state_lock:
@@ -727,7 +879,7 @@ def _enqueue_scan(target_path: str | None, trigger_source: str) -> dict:
         # A currently-running same-path scan does not block adding one queued retry.
         if has_same_path_pending:
             payload = {
-                "status": "scan already queued",
+                "status": f"{action} already queued",
                 "trigger_source": trigger_source,
                 "consolidated": True,
                 "currently_running": is_running,
@@ -740,11 +892,13 @@ def _enqueue_scan(target_path: str | None, trigger_source: str) -> dict:
                     key=key,
                     target_path=target_path,
                     trigger_source=trigger_source,
+                    action=action,
+                    event_type=event_type,
                 )
             )
             _queued_scan_keys.add(key)
             payload = {
-                "status": "scan queued",
+                "status": f"{action} queued",
                 "trigger_source": trigger_source,
                 "consolidated": False,
                 "currently_running": is_running,
@@ -761,12 +915,16 @@ def _enqueue_scan(target_path: str | None, trigger_source: str) -> dict:
 
     if target_path:
         payload["target_path"] = target_path
+    if action != "scan":
+        payload["action"] = action
+        payload["event_type"] = event_type
 
     if worker_should_start:
         _scan_worker_thread.start()
 
     logger.info(
-        "Enqueued scan request: source=%s target=%r status=%s queue_depth=%s",
+        "Enqueued %s request: source=%s target=%r status=%s queue_depth=%s",
+        action,
         trigger_source,
         target_path,
         payload.get("status"),
@@ -776,19 +934,141 @@ def _enqueue_scan(target_path: str | None, trigger_source: str) -> dict:
     return payload
 
 
-def _scan_movies_tree(db_conn, movies_share: str, movies_path: str, errors: list) -> int:
-    logger.info("Scanning movies: smb://%s/%s/%s", SMB_HOST, movies_share, movies_path)
-    movies_added = 0
-    for vf in walk_videos(SMB_HOST, movies_share, movies_path):
+def _present_video_names(dir_files) -> list:
+    """Filter a directory listing down to video filenames."""
+    return [n for n in dir_files if os.path.splitext(n)[1].lower() in VIDEO_EXTENSIONS]
+
+
+def _reconcile_scanned_dir(db_conn, vf: VideoFile, errors: list) -> None:
+    """Purge DB file rows under *vf.directory_uri* that vanished from the share.
+
+    Only called with a directory that was successfully listed (the walker's
+    scandir for it succeeded, otherwise no VideoFile would exist).
+    """
+    try:
+        purged = reconcile_directory(db_conn, vf.directory_uri, _present_video_names(vf.dir_files))
+        if purged:
+            logger.info("Reconcile: purged %d stale file(s) under %s", purged, vf.directory_uri)
+    except Exception as exc:
+        msg = f"Reconcile failed for {vf.directory_uri}: {exc}"
+        logger.warning(msg)
+        errors.append(msg)
+
+
+def _parent_dir_uri(directory_uri: str) -> str:
+    return directory_uri.rstrip("/").rsplit("/", 1)[0] + "/"
+
+
+def _reconcile_empty_scan_root(db_conn, share: str, scan_rel: str, errors: list) -> None:
+    """Reconcile a targeted scan root that yielded no videos at all.
+
+    This is the "file(s) deleted" case: the walker found nothing, so no
+    per-directory reconcile ran.  Guarded by a strict listing – when the
+    directory cannot be listed (error), nothing is deleted.
+    """
+    listing = list_smb_files_strict(build_unc(SMB_HOST, share, scan_rel))
+    if listing is None:
+        logger.info("Skip reconcile of %s: directory listing failed", scan_rel)
+        return
+    dir_uri = build_smb_dir_uri(SMB_HOST, share, scan_rel)
+    try:
+        purged = reconcile_directory(db_conn, dir_uri, _present_video_names(listing))
+        if purged:
+            logger.info("Reconcile: purged %d stale file(s) under %s", purged, dir_uri)
+    except Exception as exc:
+        msg = f"Reconcile failed for {dir_uri}: {exc}"
+        logger.warning(msg)
+        errors.append(msg)
+
+
+def _process_trailer(db_conn, vf: VideoFile, errors: list) -> None:
+    """Register a '<stem>-trailer' file as a movie extra (videoversion)."""
+    try:
+        id_movie = find_movie_id_by_dir(db_conn, vf.directory_uri)
+        if id_movie is None:
+            logger.info("Trailer %r skipped: no movie row under %s", vf.filename, vf.directory_uri)
+            return
+        if register_movie_extra(db_conn, vf.directory_uri, vf.filename, id_movie, "Trailer"):
+            logger.info("Registered trailer %r as extra for idMovie=%d", vf.filename, id_movie)
+    except Exception as exc:
+        msg = f"Trailer {vf.filename}: {exc}"
+        logger.warning(msg)
+        errors.append(msg)
+
+
+def _process_extras_dir(db_conn, videos: list, extras_type: str, errors: list) -> None:
+    """Register all videos inside an extras folder as extras of the parent movie."""
+    parent_uri = _parent_dir_uri(videos[0].directory_uri)
+    try:
+        id_movie = find_movie_id_by_dir(db_conn, parent_uri)
+    except Exception as exc:
+        msg = f"Extras lookup failed for {parent_uri}: {exc}"
+        logger.warning(msg)
+        errors.append(msg)
+        return
+    if id_movie is None:
+        logger.info(
+            "Extras dir %s skipped: no movie row in parent folder",
+            videos[0].directory_uri,
+        )
+        return
+
+    for vf in videos:
+        if vf.is_sample:
+            continue
+        type_name = "Trailer" if vf.is_trailer else extras_type
         try:
-            result = _process_movie(db_conn, vf)
-            if result is not None:
-                movies_added += 1
+            if register_movie_extra(db_conn, vf.directory_uri, vf.filename, id_movie, type_name):
+                logger.info(
+                    "Registered extra %r (%s) for idMovie=%d", vf.filename, type_name, id_movie
+                )
         except Exception as exc:
-            msg = f"Movie {vf.filename}: {exc}"
+            msg = f"Extra {vf.filename}: {exc}"
             logger.warning(msg)
             errors.append(msg)
-    return movies_added
+
+
+def _scan_movies_tree(db_conn, movies_share: str, movies_path: str, errors: list) -> tuple:
+    """Walk a movies tree; returns ``(movies_added, dirs_seen)``.
+
+    Per directory: reconcile stale DB rows first (handles upgrades/deletes),
+    then movies, then trailers/extras registration.
+    """
+    logger.info("Scanning movies: smb://%s/%s/%s", SMB_HOST, movies_share, movies_path)
+    movies_added = 0
+    dirs_seen = 0
+    for unc_dir, group in groupby(
+        walk_videos(SMB_HOST, movies_share, movies_path), key=lambda v: v.unc_dir
+    ):
+        videos = sorted(group, key=lambda v: v.filename.lower())
+        dirs_seen += 1
+        _reconcile_scanned_dir(db_conn, videos[0], errors)
+
+        dir_name = unc_dir.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        extras_type = extras_folder_type(dir_name)
+        if extras_type:
+            _process_extras_dir(db_conn, videos, extras_type, errors)
+            continue
+
+        trailers = []
+        for vf in videos:
+            if vf.is_sample:
+                continue
+            if vf.is_trailer:
+                trailers.append(vf)
+                continue
+            try:
+                if _process_movie(db_conn, vf):
+                    movies_added += 1
+            except Exception as exc:
+                msg = f"Movie {vf.filename}: {exc}"
+                logger.warning(msg)
+                errors.append(msg)
+
+        for trailer in trailers:
+            _process_trailer(db_conn, trailer, errors)
+
+    return movies_added, dirs_seen
 
 
 def _scan_tv_library(db_conn, tv_share: str, tv_path: str, errors: list) -> int:
@@ -803,8 +1083,60 @@ def _scan_tv_library(db_conn, tv_share: str, tv_path: str, errors: list) -> int:
     return episodes_added
 
 
-def _process_movie(db_conn, vf: VideoFile):
-    """Parse .nfo and upsert movie.  Returns idMovie or None."""
+def _art_url_for(directory_uri: str, filename: str) -> str:
+    """Build the smb:// URL for *filename* living in *directory_uri*."""
+    parsed = _parse_smb_dir_uri(directory_uri)
+    if not parsed:
+        return ""
+    share, rel = parsed
+    return build_smb_file_uri(SMB_HOST, share, f"{rel}/{filename}" if rel else filename)
+
+
+def _collect_movie_art(vf: VideoFile) -> dict:
+    """Classify extended artwork next to a movie file -> {art_type: url}.
+
+    Folder-level poster/fanart are skipped here (handled by the existing
+    poster_unc/fanart_unc + NFO logic); stem-prefixed variants and all
+    extended types (clearlogo, banner, landscape, clearart, characterart,
+    discart) are included.  First candidate per type wins.
+    """
+    handled = set()
+    for sidecar_unc in (vf.poster_unc, vf.fanart_unc):
+        if sidecar_unc:
+            handled.add(sidecar_unc.replace("\\", "/").rsplit("/", 1)[-1].lower())
+
+    stem = os.path.splitext(vf.filename)[0]
+    art: dict = {}
+    for name in vf.dir_files:
+        if name.lower() in handled:
+            continue
+        classified = classify_art_file(name, video_stem=stem)
+        if not classified or classified.season is not None:
+            continue
+        if classified.art_type == "thumb":
+            continue  # movies use poster; 'thumb' only applies to episodes
+        if classified.art_type in art:
+            continue
+        url = _art_url_for(vf.directory_uri, classified.filename)
+        if url:
+            art[classified.art_type] = url
+    return art
+
+
+def _sync_file_subtitles(db_conn, vf: VideoFile) -> None:
+    """Sync external subtitle streamdetails rows for a video file."""
+    if not vf.subtitles:
+        return
+    id_file = get_file_id(db_conn, vf.directory_uri, vf.filename)
+    if id_file is None:
+        return
+    inserted = sync_subtitle_streams(db_conn, id_file, vf.subtitles)
+    if inserted:
+        logger.info("Subtitles: %d language row(s) for %r", inserted, vf.filename)
+
+
+def _process_movie(db_conn, vf: VideoFile) -> bool:
+    """Parse .nfo and upsert movie + sidecars.  Returns True when newly added."""
     nfo = None
 
     if vf.nfo_unc:
@@ -815,7 +1147,7 @@ def _process_movie(db_conn, vf: VideoFile):
     if not nfo or not nfo.title:
         guessed = guess_movie_from_filename(vf.filename) or guess_movie_from_filename(vf.directory_uri.rstrip("/").rsplit("/", 1)[-1])
         if not guessed:
-            return None
+            return False
         nfo = MovieNfo(title=guessed.title, year=guessed.year)
 
     if vf.poster_unc:
@@ -831,10 +1163,76 @@ def _process_movie(db_conn, vf: VideoFile):
         fanart_name = vf.fanart_unc.replace("\\", "/").rsplit("/", 1)[-1]
         nfo.fanart = build_smb_file_uri(SMB_HOST, share_name, f"{directory_name}/{fanart_name}")
 
-    result = upsert_movie(db_conn, vf.directory_uri, vf.filename, vf.smb_uri, nfo)
-    if result is not None:
+    outcome = upsert_movie(db_conn, vf.directory_uri, vf.filename, vf.smb_uri, nfo)
+    if outcome.created:
         logger.info("Added movie: %r", nfo.title)
-    return result
+
+    _sync_file_subtitles(db_conn, vf)
+
+    movie_art = _collect_movie_art(vf)
+    if movie_art:
+        changed = upsert_art_batch(db_conn, "movie", outcome.media_id, movie_art)
+        if changed:
+            logger.info("Artwork: %d extended art row(s) for %r", changed, nfo.title)
+
+    return outcome.created
+
+
+def _process_tvshow_art(db_conn, tv_share: str, show_root_rel: str, idShow: int, show_nfo) -> None:
+    """Upsert show-level and season artwork found in the show root directory."""
+    show_unc = build_unc(SMB_HOST, tv_share, show_root_rel)
+    file_names = list_smb_files(show_unc)
+
+    show_art: dict = {}
+    season_art: dict = {}
+    for name in sorted(file_names):
+        classified = classify_art_file(name)
+        if not classified:
+            continue
+        url = build_smb_file_uri(
+            SMB_HOST, tv_share, f"{show_root_rel.strip('/')}/{classified.filename}".strip("/")
+        )
+        if classified.season is None:
+            show_art.setdefault(classified.art_type, url)
+        else:
+            season_art.setdefault(classified.season, {}).setdefault(classified.art_type, url)
+
+    # NFO fallback: only when no local poster/fanart was found.
+    if "poster" not in show_art and show_nfo.thumb:
+        show_art["poster"] = show_nfo.thumb
+    if "fanart" not in show_art and show_nfo.fanart:
+        show_art["fanart"] = show_nfo.fanart
+
+    if show_art:
+        changed = upsert_art_batch(db_conn, "tvshow", idShow, show_art)
+        if changed:
+            logger.info("Artwork: %d show art row(s) for idShow=%d", changed, idShow)
+
+    for season_num, art in sorted(season_art.items()):
+        id_season = ensure_season(db_conn, idShow, season_num)
+        changed = upsert_art_batch(db_conn, "season", id_season, art)
+        if changed:
+            logger.info(
+                "Artwork: %d season art row(s) for idShow=%d season=%d",
+                changed, idShow, season_num,
+            )
+
+
+def _process_episode_art(db_conn, vf: VideoFile, outcomes: list) -> None:
+    """Upsert a local episode thumb ('<stem>-thumb.jpg' / '<stem>.tbn') if present."""
+    if not outcomes:
+        return
+    stem = os.path.splitext(vf.filename)[0]
+    for name in vf.dir_files:
+        classified = classify_art_file(name, video_stem=stem)
+        if not classified or classified.season is not None or classified.art_type != "thumb":
+            continue
+        url = _art_url_for(vf.directory_uri, classified.filename)
+        if not url:
+            continue
+        for outcome in outcomes:
+            upsert_art_batch(db_conn, "episode", outcome.media_id, {"thumb": url})
+        return  # one thumb per video file
 
 
 def _process_tvshow(
@@ -869,29 +1267,47 @@ def _process_tvshow(
 
     logger.info("TV show: %r (idShow=%d)", show_nfo.title, idShow)
 
+    try:
+        _process_tvshow_art(db_conn, tv_share, show_root_rel, idShow, show_nfo)
+    except Exception as exc:
+        msg = f"TV show artwork {show_name}: {exc}"
+        logger.warning(msg)
+        errors.append(msg)
+
     episodes_added = 0
-    for vf in walk_videos(SMB_HOST, tv_share, scan_rel):
-        try:
-            if not vf.nfo_unc:
+    for unc_dir, group in groupby(
+        walk_videos(SMB_HOST, tv_share, scan_rel), key=lambda v: v.unc_dir
+    ):
+        videos = sorted(group, key=lambda v: v.filename.lower())
+        _reconcile_scanned_dir(db_conn, videos[0], errors)
+
+        for vf in videos:
+            if vf.is_sample or vf.is_trailer:
                 continue
-            ep_content = read_smb_file(vf.nfo_unc)
-            if not ep_content:
-                continue
-            ep_nfo = parse_episode_nfo(ep_content)
-            if not ep_nfo or not ep_nfo.title:
-                continue
-            result = upsert_episode(
-                db_conn, vf.directory_uri, vf.filename, vf.smb_uri, idShow, ep_nfo
-            )
-            if result is not None:
-                episodes_added += 1
-                logger.info(
-                    "Added episode: %r S%sE%s", ep_nfo.title, ep_nfo.season, ep_nfo.episode
+            try:
+                if not vf.nfo_unc:
+                    continue
+                ep_content = read_smb_file(vf.nfo_unc)
+                if not ep_content:
+                    continue
+                ep_nfos = [n for n in parse_episode_nfos(ep_content) if n.title]
+                if not ep_nfos:
+                    continue
+                outcomes = upsert_episodes_for_file(
+                    db_conn, vf.directory_uri, vf.filename, vf.smb_uri, idShow, ep_nfos
                 )
-        except Exception as exc:
-            msg = f"Episode {vf.filename}: {exc}"
-            logger.warning(msg)
-            errors.append(msg)
+                for nfo, outcome in zip(ep_nfos, outcomes):
+                    if outcome.created:
+                        episodes_added += 1
+                        logger.info(
+                            "Added episode: %r S%sE%s", nfo.title, nfo.season, nfo.episode
+                        )
+                _sync_file_subtitles(db_conn, vf)
+                _process_episode_art(db_conn, vf, outcomes)
+            except Exception as exc:
+                msg = f"Episode {vf.filename}: {exc}"
+                logger.warning(msg)
+                errors.append(msg)
 
     return episodes_added
 
@@ -1073,20 +1489,34 @@ async def dashboard(request: Request):
 @app.post("/scan")
 @app.get("/scan")
 async def trigger_scan(request: Request):
-    """Queue a scan request; scans run one-at-a-time in FIFO order."""
-    target_path = await _extract_target_path(request)
+    """Queue a scan (or delete) request; work runs one-at-a-time in FIFO order.
+
+    Sonarr/Radarr delete events (MovieFileDelete, EpisodeFileDelete,
+    MovieDelete, SeriesDelete) are routed to the DB cascade; Test events are
+    acknowledged without work; everything else triggers a scan as before.
+    """
+    target_path, event_type = await _extract_webhook_payload(request)
     trigger_source = _normalize_trigger_source(request)
-    if trigger_source == "dashboard":
-        trigger_source = "dashboard"
 
     client_host = request.client.host if request.client else "unknown"
     logger.info(
-        "Incoming /scan trigger: method=%s source=%s client=%s target=%r",
+        "Incoming /scan trigger: method=%s source=%s client=%s target=%r event=%r",
         request.method,
         trigger_source,
         client_host,
         target_path,
+        event_type,
     )
+
+    if _is_skip_event(event_type):
+        logger.info("Skipping webhook Test event from %s", trigger_source)
+        return JSONResponse({"status": "test event acknowledged"}, status_code=200)
+
+    if _is_delete_event(event_type):
+        payload = _enqueue_scan(
+            target_path, trigger_source, action="delete", event_type=event_type
+        )
+        return JSONResponse(payload, status_code=202)
 
     payload = _enqueue_scan(target_path, trigger_source)
     return JSONResponse(payload, status_code=202)
